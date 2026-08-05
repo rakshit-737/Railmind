@@ -1,0 +1,286 @@
+// RailMind API client. Talks to the FastAPI agent service when reachable and
+// falls back to a fully-featured local mock (same canonical network) so the
+// dashboard always works — even with no backend running.
+
+import {
+  STATIONS,
+  TRACKS,
+  TRAINS,
+  findPath,
+  stationName,
+  trackById,
+  type Train,
+} from "./railmind-data";
+
+export type AgentOutputs = {
+  weather: { strategy: string; risk_score: number; high_risk_tracks: string[] };
+  track: { actions: string[] };
+  signal: { actions: string[] };
+  routing: {
+    affected_trains: string[];
+    reroutes: { train: string; from: string[]; to: string[] }[];
+  };
+};
+
+export type Plan = {
+  id: string;
+  name: string;
+  delay_min: number;
+  risk: number;
+  passengers_impacted: number;
+  congestion: number;
+  score: number; // 0-100, higher is better
+  actions: string[];
+};
+
+export type LogEvent = { t: string; source: string; message: string };
+
+export type RunResponse = {
+  injected_failure?: string;
+  twin_source?: string;
+  recommended_action: Plan;
+  candidate_plans: Plan[];
+  agent_outputs: AgentOutputs;
+  execution_log: LogEvent[];
+  failed_tracks: string[];
+  rerouted_trains: { id: string; newRoute: string[] }[];
+  held_trains?: string[];
+  trains?: Train[];
+};
+
+const API_BASE_URL: string =
+  (import.meta.env?.VITE_API_BASE_URL as string | undefined) ?? "http://127.0.0.1:8001";
+
+function nowHMS(offset = 0) {
+  const d = new Date(Date.now() + offset * 1000);
+  return d.toTimeString().slice(0, 8);
+}
+
+// ── Mock pipeline (mirrors the FastAPI agent flow on the same network) ──────
+
+function buildMockRun(trackId?: string): RunResponse {
+  const failed = trackId ?? "T23";
+  const t = trackById(failed);
+  const fromName = stationName(t?.from ?? "NAGPUR_JUNCT");
+  const toName = stationName(t?.to ?? "RAIPUR_JUNCT");
+
+  const crossesFailure = (route: string[]) =>
+    route.some(
+      (s, i) =>
+        i < route.length - 1 &&
+        !!t &&
+        ((s === t.from && route[i + 1] === t.to) || (s === t.to && route[i + 1] === t.from)),
+    );
+
+  const affected = TRAINS.filter((tr) => crossesFailure(tr.route));
+  const passengers = affected.reduce((a, b) => a + b.passengers, 0);
+
+  const reroutes = affected.map((tr) => {
+    const alt = findPath(tr.route[0], tr.route[tr.route.length - 1], [failed]);
+    return { train: tr.id, from: tr.route, to: alt ?? tr.route };
+  });
+
+  const monitored = TRACKS.filter((x) => x.status === "monitored" && x.id !== failed).map(
+    (x) => x.id,
+  );
+
+  const agent_outputs: AgentOutputs = {
+    weather: { strategy: "W5", risk_score: 0.05, high_risk_tracks: [] },
+    track: {
+      actions: [`T_CLOSE_${failed}`, ...monitored.slice(0, 3).map((id) => `T_MONITOR_${id}`)],
+    },
+    signal: {
+      actions: [`S_YELLOW_${failed}`, ...monitored.slice(0, 2).map((id) => `S_YELLOW_${id}`)],
+    },
+    routing: {
+      affected_trains: affected.map((a) => a.id),
+      reroutes,
+    },
+  };
+
+  const plans: Plan[] = [
+    {
+      id: "A",
+      name: "Plan A — Safety First",
+      delay_min: 30 + reroutes.length * 15,
+      risk: 0.18,
+      passengers_impacted: passengers,
+      congestion: 0.45,
+      score: 84,
+      actions: [
+        `Close track ${failed}`,
+        `Signal RED on ${failed}`,
+        ...affected.map((a) => `Reroute ${a.id}`),
+      ],
+    },
+    {
+      id: "B",
+      name: "Plan B — Balanced Response",
+      delay_min: 15 + reroutes.length * 15,
+      risk: 0.24,
+      passengers_impacted: passengers,
+      congestion: 0.35,
+      score: 95,
+      actions: [
+        `Speed-limit 60 km/h on ${failed}`,
+        `Signal YELLOW on ${failed}`,
+        ...affected.map((a) => `Reroute ${a.id}`),
+      ],
+    },
+    {
+      id: "C",
+      name: "Plan C — Minimal Intervention",
+      delay_min: 60 * Math.max(affected.length, 1),
+      risk: 0.85,
+      passengers_impacted: passengers,
+      congestion: 0.7,
+      score: 21,
+      actions: [`Monitor ${failed}`, "Keep all signals GREEN", "No reroutes"],
+    },
+  ];
+
+  const recommended = plans.reduce((a, b) => (a.score >= b.score ? a : b));
+
+  const log: LogEvent[] = [
+    {
+      t: nowHMS(-7),
+      source: "Sensor",
+      message: `Anomaly detected on track ${failed} (${fromName} ↔ ${toName})`,
+    },
+    {
+      t: nowHMS(-6),
+      source: "Weather",
+      message: "Nominal conditions — no weather action required",
+    },
+    { t: nowHMS(-6), source: "Track", message: `Track Agent flagged ${failed} for closure` },
+    { t: nowHMS(-5), source: "Signal", message: `Signal Agent set ${failed} to YELLOW` },
+    ...affected.map((a, i) => ({
+      t: nowHMS(-4 + i * 0.1),
+      source: "Routing",
+      message: `Routing Agent computed alternate path for ${a.id}`,
+    })),
+    {
+      t: nowHMS(-3),
+      source: "Planner",
+      message: `Planner generated ${plans.length} candidate plans`,
+    },
+    { t: nowHMS(-2), source: "Simulator", message: "Simulator evaluated plans on cloned twin" },
+    {
+      t: nowHMS(0),
+      source: "Master",
+      message: `Master Agent selected ${recommended.name} (score ${recommended.score}/100)`,
+    },
+  ];
+  log.reverse(); // newest first
+
+  return {
+    injected_failure: trackId,
+    twin_source: "mock (offline)",
+    recommended_action: recommended,
+    candidate_plans: plans,
+    agent_outputs,
+    execution_log: log,
+    failed_tracks: [failed],
+    rerouted_trains: reroutes.map((r) => ({ id: r.train, newRoute: r.to })),
+    held_trains: [],
+    trains: TRAINS,
+  };
+}
+
+// ── Real backend adapter ────────────────────────────────────────────────────
+
+function isValidRunResponse(x: unknown): x is RunResponse {
+  if (!x || typeof x !== "object") return false;
+  const r = x as Record<string, unknown>;
+  const rec = r.recommended_action as Record<string, unknown> | undefined;
+  return (
+    !!rec &&
+    typeof rec.id === "string" &&
+    typeof rec.score === "number" &&
+    Array.isArray(r.candidate_plans) &&
+    Array.isArray(r.execution_log)
+  );
+}
+
+function normalize(r: RunResponse): RunResponse {
+  return {
+    ...r,
+    failed_tracks: r.failed_tracks ?? [],
+    rerouted_trains: r.rerouted_trains ?? [],
+    held_trains: r.held_trains ?? [],
+    trains: r.trains && r.trains.length > 0 ? r.trains : TRAINS,
+    agent_outputs: {
+      weather: r.agent_outputs?.weather ?? { strategy: "—", risk_score: 0, high_risk_tracks: [] },
+      track: r.agent_outputs?.track ?? { actions: [] },
+      signal: r.agent_outputs?.signal ?? { actions: [] },
+      routing: r.agent_outputs?.routing ?? { affected_trains: [], reroutes: [] },
+    },
+  };
+}
+
+async function tryFetch(url: string, init?: RequestInit): Promise<RunResponse | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json: unknown = await res.json();
+    return isValidRunResponse(json) ? normalize(json) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function runSimulation(): Promise<RunResponse> {
+  const real = await tryFetch(`${API_BASE_URL}/run`, { method: "POST" });
+  if (real) return real;
+  await new Promise((r) => setTimeout(r, 600));
+  return buildMockRun();
+}
+
+export async function injectTrackFailure(trackId: string): Promise<RunResponse> {
+  const real = await tryFetch(`${API_BASE_URL}/simulate-track-failure/${trackId}`, {
+    method: "POST",
+  });
+  if (real) return real;
+  await new Promise((r) => setTimeout(r, 600));
+  return buildMockRun(trackId);
+}
+
+export async function injectWeather(trackId: string, condition = "STORM"): Promise<RunResponse> {
+  const real = await tryFetch(
+    `${API_BASE_URL}/simulate-weather/${trackId}?condition=${encodeURIComponent(condition)}`,
+    { method: "POST" },
+  );
+  if (real) return real;
+  await new Promise((r) => setTimeout(r, 600));
+  // Mock approximation: storms degrade the track badly enough to close it.
+  const mock = buildMockRun(trackId);
+  mock.agent_outputs.weather = { strategy: "W1", risk_score: 0.85, high_risk_tracks: [trackId] };
+  mock.execution_log = [
+    {
+      t: nowHMS(0),
+      source: "Weather",
+      message: `${condition} reported on ${trackId} — emergency weather protocol`,
+    },
+    ...mock.execution_log,
+  ];
+  return mock;
+}
+
+export function incidentSummary(r: RunResponse | null) {
+  if (!r || !r.failed_tracks?.length) return null;
+  const failed = r.failed_tracks[0];
+  const t = trackById(failed);
+  const from = t ? stationName(t.from) : "—";
+  const to = t ? stationName(t.to) : "—";
+  const affected = r.agent_outputs.routing.affected_trains;
+  const fleet = r.trains ?? TRAINS;
+  const passengers = fleet
+    .filter((tr) => affected.includes(tr.id))
+    .reduce((a, b) => a + b.passengers, 0);
+  return { trackId: failed, from, to, affectedCount: affected.length, passengers };
+}
+
+export { STATIONS, TRACKS, TRAINS };

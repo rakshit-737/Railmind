@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+langgraph>=0.2
+networkx>=3.0
+requests>=2.31
+pydantic>=2.0
