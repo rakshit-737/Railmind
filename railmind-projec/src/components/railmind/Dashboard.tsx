@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  BarChart3,
   CheckCircle2,
   Cloud,
   CloudLightning,
@@ -9,12 +10,25 @@ import {
   Loader2,
   Play,
   Radio,
+  RotateCcw,
   Route,
   ShieldAlert,
   Siren,
+  Sparkles,
   Train,
   Zap,
 } from "lucide-react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip as ChartTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -28,14 +42,21 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { NetworkMap } from "./NetworkMap";
 import { TrainsPanel, getTrainRoute } from "./TrainsPanel";
-import { TRACKS, TRAINS, stationName } from "@/lib/railmind-data";
+import { TRACKS, TRAINS, stationName, type Train as TrainType } from "@/lib/railmind-data";
 import {
+  applyPlan,
+  fetchLiveState,
   incidentSummary,
   injectTrackFailure,
   injectWeather,
+  resetTwin,
   runSimulation,
+  runSimulationStream,
+  type LiveState,
+  type LogEvent,
   type Plan,
   type RunResponse,
+  type StreamParams,
 } from "@/lib/railmind-api";
 
 function useClock() {
@@ -83,57 +104,190 @@ function planColor(score: number, allScores: number[]) {
   return { ring: "", text: "text-warning", bar: "bg-warning" };
 }
 
+type RunRecord = {
+  run: number;
+  score: number;
+  delay: number;
+  risk: number;
+  plan: string;
+};
+
 export function Dashboard() {
   const now = useClock();
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<RunResponse | null>(null);
   const [trackId, setTrackId] = useState<string>("T23");
   const [selectedTrain, setSelectedTrain] = useState<string | null>(null);
+  const [selectedPlan, setSelectedPlan] = useState<string | null>(null);
+  const [live, setLive] = useState<LiveState | null>(null);
+  const [liveLog, setLiveLog] = useState<LogEvent[]>([]);
+  const [history, setHistory] = useState<RunRecord[]>([]);
+  const [offlineTrains, setOfflineTrains] = useState<TrainType[]>(() =>
+    TRAINS.map((t) => ({ ...t, current_station: t.route[0], route_index: 0, progress: 0 })),
+  );
+  const busyRef = useRef(false);
+  // Latest-wins guard: an in-flight interval poll must not overwrite a
+  // fresher post-run/post-apply snapshot with stale state.
+  const liveSeqRef = useRef({ issued: 0, applied: 0 });
+
+  const refreshLive = useCallback(async () => {
+    const seq = ++liveSeqRef.current.issued;
+    const state = await fetchLiveState();
+    if (seq <= liveSeqRef.current.applied) return state;
+    liveSeqRef.current.applied = seq;
+    setLive(state);
+    return state;
+  }, []);
+
+  // ── Live twin polling; offline mode animates the fallback fleet locally ──
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      if (busyRef.current) return;
+      const state = await refreshLive();
+      if (stopped) return;
+      if (!state) {
+        setOfflineTrains((prev) =>
+          prev.map((t) => {
+            const idx = t.route_index ?? 0;
+            let progress = (t.progress ?? 0) + 0.18;
+            let routeIndex = idx;
+            let route = t.route;
+            if (progress >= 1) {
+              progress = 0;
+              routeIndex = idx + 1;
+              if (routeIndex >= route.length - 1) {
+                route = [...route].reverse();
+                routeIndex = 0;
+              }
+            }
+            return {
+              ...t,
+              route,
+              route_index: routeIndex,
+              progress,
+              current_station: route[routeIndex],
+            };
+          }),
+        );
+      }
+    };
+    void poll();
+    const id = setInterval(() => void poll(), 3000);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  }, [refreshLive]);
+
+  const recordRun = useCallback((r: RunResponse) => {
+    setHistory((prev) => [
+      ...prev,
+      {
+        run: prev.length + 1,
+        score: r.recommended_action.score,
+        delay: r.recommended_action.delay_min,
+        risk: r.recommended_action.risk,
+        plan: r.recommended_action.id,
+      },
+    ]);
+  }, []);
+
+  const execute = useCallback(
+    async (params: StreamParams, fallback: () => Promise<RunResponse>) => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      setLoading(true);
+      setLiveLog([]);
+      setSelectedPlan(null);
+      try {
+        const streamed = await runSimulationStream(
+          (e) => setLiveLog((prev) => [e, ...prev]),
+          params,
+        );
+        // If the stream delivered anything, the backend already applied the
+        // injection — a retry must use plain /run, never re-inject.
+        const result =
+          streamed.result ?? (streamed.sawEvents ? await runSimulation() : await fallback());
+        setData(result);
+        recordRun(result);
+        await refreshLive();
+      } finally {
+        setLoading(false);
+        busyRef.current = false;
+      }
+    },
+    [recordRun, refreshLive],
+  );
+
+  const doRun = useCallback(() => execute({}, runSimulation), [execute]);
+  const doInject = useCallback(
+    () => execute({ injectTrack: trackId }, () => injectTrackFailure(trackId)),
+    [execute, trackId],
+  );
+  const doStorm = useCallback(
+    () => execute({ weatherTrack: trackId, condition: "STORM" }, () => injectWeather(trackId)),
+    [execute, trackId],
+  );
+
+  async function doApply() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setLoading(true);
+    try {
+      const result = await applyPlan(selectedPlan ?? undefined);
+      if (result) {
+        setData(result);
+        recordRun(result);
+        setSelectedPlan(null);
+        await refreshLive();
+      } else if (data) {
+        // Backend offline — mirror the execution on the mock data so the
+        // button still gives visible feedback.
+        const target = plans.find((p) => p.id === selectedPlan) ?? data.recommended_action;
+        setData({
+          ...data,
+          executed_plan: target.id,
+          applied_actions: target.actions,
+          execution_log: [
+            {
+              t: new Date().toTimeString().slice(0, 8),
+              source: "Executor",
+              message: `Plan ${target.id} executed (offline mock — no live twin connected)`,
+            },
+            ...data.execution_log,
+          ],
+        });
+        setSelectedPlan(null);
+      }
+    } finally {
+      setLoading(false);
+      busyRef.current = false;
+    }
+  }
+
+  async function doReset() {
+    await resetTwin();
+    setData(null);
+    setLiveLog([]);
+    setSelectedPlan(null);
+    setSelectedTrain(null);
+    await refreshLive();
+  }
 
   // Demo shortcuts: /?autorun runs the pipeline, /?inject=T23 injects a failure.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const inject = params.get("inject");
     if (!params.has("autorun") && !inject) return;
-    void (async () => {
-      setLoading(true);
-      try {
-        if (inject) {
-          setTrackId(inject);
-          setData(await injectTrackFailure(inject));
-        } else {
-          setData(await runSimulation());
-        }
-      } finally {
-        setLoading(false);
-      }
-    })();
+    if (inject) {
+      setTrackId(inject);
+      void execute({ injectTrack: inject }, () => injectTrackFailure(inject));
+    } else {
+      void doRun();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  async function doRun() {
-    setLoading(true);
-    try {
-      setData(await runSimulation());
-    } finally {
-      setLoading(false);
-    }
-  }
-  async function doInject() {
-    setLoading(true);
-    try {
-      setData(await injectTrackFailure(trackId));
-    } finally {
-      setLoading(false);
-    }
-  }
-  async function doStorm() {
-    setLoading(true);
-    try {
-      setData(await injectWeather(trackId, "STORM"));
-    } finally {
-      setLoading(false);
-    }
-  }
 
   const incident = useMemo(() => incidentSummary(data), [data]);
   const status: "operational" | "warning" | "incident" = !data
@@ -144,7 +298,29 @@ export function Dashboard() {
 
   const plans: Plan[] = data?.candidate_plans ?? [];
   const scores = plans.map((p) => p.score);
-  const trains = data?.trains ?? TRAINS;
+  // Prefer the polling snapshot; a run's train list only counts as "live" when
+  // it carries positions — otherwise keep the locally animated fallback fleet.
+  const dataTrainsAreLive = !!data?.trains?.some(
+    (t) => typeof t.progress === "number" && t.current_station,
+  );
+  const trains = live?.trains ?? (dataTrainsAreLive && data?.trains ? data.trains : offlineTrains);
+  const twinSource = live?.twin_source ?? data?.twin_source;
+
+  // Map layers: live closed tracks + selected-plan preview override
+  const liveClosed = useMemo(
+    () => (live ? live.tracks.filter((t) => t.status === "CLOSED").map((t) => t.id) : []),
+    [live],
+  );
+  const previewPlan = selectedPlan != null ? plans.find((p) => p.id === selectedPlan) : undefined;
+  const mapFailed = previewPlan
+    ? Array.from(new Set([...(previewPlan.failed_tracks ?? []), ...liveClosed]))
+    : Array.from(new Set([...(data?.failed_tracks ?? []), ...liveClosed]));
+  const mapRerouted = previewPlan
+    ? (previewPlan.rerouted_trains ?? [])
+    : (data?.rerouted_trains ?? []);
+  const heldTrains = trains.filter((t) => t.held).map((t) => t.id);
+
+  const timeline = loading && liveLog.length > 0 ? liveLog : (data?.execution_log ?? liveLog);
 
   return (
     <div className="min-h-screen text-foreground">
@@ -220,6 +396,16 @@ export function Dashboard() {
             </div>
             <Button
               size="sm"
+              variant="ghost"
+              onClick={doReset}
+              disabled={loading}
+              className="h-9 text-muted-foreground"
+              title="Reset the twin to baseline"
+            >
+              <RotateCcw className="h-4 w-4" />
+            </Button>
+            <Button
+              size="sm"
               onClick={doRun}
               disabled={loading}
               className="h-9 bg-success text-primary-foreground hover:bg-success/90 glow-green"
@@ -258,8 +444,10 @@ export function Dashboard() {
               </div>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">Track</span>
-                  <span className="font-mono-mc">{incident.trackId}</span>
+                  <span className="text-muted-foreground">
+                    Track{mapFailed.length > 1 ? "s" : ""}
+                  </span>
+                  <span className="font-mono-mc">{(data?.failed_tracks ?? []).join(", ")}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Location</span>
@@ -279,6 +467,12 @@ export function Dashboard() {
                   <span className="text-muted-foreground">Passengers</span>
                   <span className="font-mono-mc">{incident.passengers}</span>
                 </div>
+                {heldTrains.length > 0 && (
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Held</span>
+                    <span className="text-danger font-mono-mc">{heldTrains.join(", ")}</span>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
@@ -299,23 +493,22 @@ export function Dashboard() {
               <Activity className="h-4 w-4 text-info" />
               <div className="text-sm font-semibold">Live Digital Twin Network</div>
               <Badge variant="outline" className="ml-2 font-mono-mc text-[10px]">
-                {data?.twin_source
-                  ? `TWIN: ${data.twin_source.replace(/^https?:\/\//, "")}`
-                  : "REAL-TIME"}
+                {twinSource ? `TWIN: ${twinSource.replace(/^https?:\/\//, "")}` : "CONNECTING…"}
               </Badge>
             </div>
             <div className="text-[11px] text-muted-foreground font-mono-mc">
-              {data?.failed_tracks?.length ?? 0} closed · {data?.rerouted_trains?.length ?? 0}{" "}
-              rerouted
+              {mapFailed.length} closed · {mapRerouted.length} rerouted
               {selectedTrain && <span className="text-info"> · {selectedTrain} highlighted</span>}
             </div>
           </div>
           <div className="h-[520px]">
             <NetworkMap
               trains={trains}
-              failedTracks={data?.failed_tracks ?? []}
-              reroutedTrains={data?.rerouted_trains ?? []}
-              highlightedRoute={getTrainRoute(selectedTrain, trains, data?.rerouted_trains ?? [])}
+              failedTracks={mapFailed}
+              reroutedTrains={mapRerouted}
+              weather={live?.weather ?? {}}
+              previewLabel={previewPlan ? previewPlan.name : null}
+              highlightedRoute={getTrainRoute(selectedTrain, trains, mapRerouted)}
               highlightedTrainId={selectedTrain}
             />
           </div>
@@ -328,7 +521,7 @@ export function Dashboard() {
             selectedTrain={selectedTrain}
             onSelect={setSelectedTrain}
             reroutedTrains={data?.rerouted_trains ?? []}
-            heldTrains={data?.held_trains ?? []}
+            heldTrains={heldTrains}
           />
         </div>
 
@@ -399,13 +592,18 @@ export function Dashboard() {
 
         {/* Plans */}
         <Card className="col-span-12 xl:col-span-7 p-4 glass">
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-1">
             <GitBranch className="h-4 w-4 text-info" />
             <div className="text-sm font-semibold">Generated Plans</div>
             <Badge variant="outline" className="ml-2 font-mono-mc text-[10px]">
               CANDIDATES
             </Badge>
           </div>
+          {plans.length > 0 && (
+            <div className="text-[11px] text-muted-foreground mb-3">
+              Click a plan to preview its closures and reroutes on the map.
+            </div>
+          )}
           {plans.length === 0 ? (
             <EmptyHint text="Run a simulation to generate candidate plans." />
           ) : (
@@ -413,15 +611,29 @@ export function Dashboard() {
               {plans.map((p) => {
                 const c = planColor(p.score, scores);
                 const isBest = p.id === data?.recommended_action.id;
+                const isSelected = selectedPlan === p.id;
                 return (
-                  <div key={p.id} className={`rounded-lg p-3 glass ${c.ring}`}>
+                  <button
+                    key={p.id}
+                    onClick={() => setSelectedPlan(isSelected ? null : p.id)}
+                    className={`text-left rounded-lg p-3 glass transition-all ${c.ring} ${
+                      isSelected ? "border-info glow-blue" : "hover:border-info/50"
+                    }`}
+                  >
                     <div className="flex items-center justify-between">
                       <div className="font-semibold font-mono-mc">Plan {p.id}</div>
-                      {isBest && (
-                        <Badge className="bg-success text-primary-foreground font-mono-mc text-[10px]">
-                          BEST
-                        </Badge>
-                      )}
+                      <div className="flex gap-1">
+                        {isSelected && (
+                          <Badge className="bg-info/20 text-info border-info/40 font-mono-mc text-[10px]">
+                            PREVIEW
+                          </Badge>
+                        )}
+                        {isBest && (
+                          <Badge className="bg-success text-primary-foreground font-mono-mc text-[10px]">
+                            BEST
+                          </Badge>
+                        )}
+                      </div>
                     </div>
                     <div className="text-[11px] text-muted-foreground mt-0.5 truncate">
                       {p.name}
@@ -444,7 +656,7 @@ export function Dashboard() {
                         />
                       </div>
                     </div>
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -486,6 +698,23 @@ export function Dashboard() {
                 </div>
               </div>
 
+              {data.explanation && (
+                <div className="mt-3 rounded-md bg-secondary/40 border border-border px-3 py-2.5">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <Sparkles className="h-3.5 w-3.5 text-info" />
+                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+                      Why this plan
+                    </span>
+                    <Badge variant="outline" className="ml-auto font-mono-mc text-[9px]">
+                      {data.explanation.source === "claude" ? "CLAUDE AI" : "RULE ENGINE"}
+                    </Badge>
+                  </div>
+                  <p className="text-xs leading-relaxed text-foreground/90">
+                    {data.explanation.text}
+                  </p>
+                </div>
+              )}
+
               <div className="grid grid-cols-3 gap-3 mt-4">
                 <Metric
                   label="Expected Delay"
@@ -517,32 +746,52 @@ export function Dashboard() {
                   ))}
                 </ul>
               </div>
+
+              <Button
+                size="sm"
+                onClick={doApply}
+                disabled={loading}
+                className="mt-4 w-full bg-info text-primary-foreground hover:bg-info/90"
+              >
+                {loading ? (
+                  <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
+                ) : (
+                  <Zap className="h-4 w-4 mr-1.5" />
+                )}
+                Execute {selectedPlan ? `Plan ${selectedPlan}` : "Recommended Plan"} on Live Twin
+              </Button>
+              {data.executed_plan && (
+                <div className="mt-2 text-[11px] text-info font-mono-mc text-center">
+                  Plan {data.executed_plan} executed — {data.applied_actions?.length ?? 0} action(s)
+                  applied to the twin.
+                </div>
+              )}
             </div>
           )}
         </Card>
 
         {/* Timeline */}
-        <Card className="col-span-12 p-0 glass overflow-hidden">
+        <Card className="col-span-12 xl:col-span-7 p-0 glass overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-info" />
               <div className="text-sm font-semibold">Agent Timeline</div>
               <Badge variant="outline" className="ml-2 font-mono-mc text-[10px]">
-                EVENT LOG
+                {loading ? "STREAMING" : "EVENT LOG"}
               </Badge>
             </div>
             <div className="text-[11px] text-muted-foreground font-mono-mc">
-              {data?.execution_log.length ?? 0} events
+              {timeline.length} events
             </div>
           </div>
-          <ScrollArea className="h-[240px]">
+          <ScrollArea className="h-[260px]">
             <div className="px-4 py-2">
-              {!data ? (
+              {timeline.length === 0 ? (
                 <EmptyHint text="No events yet." />
               ) : (
                 <ol className="relative border-l border-border ml-2">
-                  {data.execution_log.map((e, i) => (
-                    <li key={i} className="ml-4 py-2">
+                  {timeline.map((e, i) => (
+                    <li key={`${e.t}-${e.source}-${i}`} className="ml-4 py-2">
                       <span className="absolute -left-1.5 mt-1.5 h-3 w-3 rounded-full bg-success glow-green" />
                       <div className="flex items-baseline gap-3 font-mono-mc">
                         <span className="text-xs text-muted-foreground w-20 shrink-0">{e.t}</span>
@@ -559,8 +808,113 @@ export function Dashboard() {
           </ScrollArea>
         </Card>
 
+        {/* Analytics */}
+        <Card className="col-span-12 xl:col-span-5 p-4 glass">
+          <div className="flex items-center gap-2 mb-3">
+            <BarChart3 className="h-4 w-4 text-info" />
+            <div className="text-sm font-semibold">Run Analytics</div>
+            <Badge variant="outline" className="ml-2 font-mono-mc text-[10px]">
+              {history.length} RUNS
+            </Badge>
+          </div>
+          {history.length === 0 ? (
+            <EmptyHint text="Run the pipeline a few times — score and delay trends appear here." />
+          ) : (
+            <div className="space-y-4">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc mb-1">
+                  Recommended-plan score per run (0–100)
+                </div>
+                <div className="h-[104px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={history} margin={{ top: 6, right: 8, bottom: 0, left: -22 }}>
+                      <CartesianGrid stroke="var(--border)" strokeOpacity={0.4} vertical={false} />
+                      <XAxis
+                        dataKey="run"
+                        tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
+                        tickLine={false}
+                        axisLine={{ stroke: "var(--border)" }}
+                      />
+                      <YAxis
+                        domain={[0, 100]}
+                        tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
+                        tickLine={false}
+                        axisLine={false}
+                      />
+                      <ChartTooltip
+                        cursor={{ stroke: "var(--info)", strokeOpacity: 0.4 }}
+                        contentStyle={{
+                          background: "oklch(0.18 0.03 260)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 8,
+                          fontSize: 11,
+                        }}
+                        labelFormatter={(l) => `Run ${l}`}
+                        formatter={(value, _name, item) => [
+                          `${value}/100 (Plan ${(item?.payload as RunRecord | undefined)?.plan ?? "?"})`,
+                          "Score",
+                        ]}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="score"
+                        stroke="var(--info)"
+                        strokeWidth={2}
+                        dot={{ r: 3, fill: "var(--info)", strokeWidth: 0 }}
+                        activeDot={{ r: 5 }}
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc mb-1">
+                  Expected delay per run (minutes)
+                </div>
+                <div className="h-[104px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={history} margin={{ top: 6, right: 8, bottom: 0, left: -22 }}>
+                      <CartesianGrid stroke="var(--border)" strokeOpacity={0.4} vertical={false} />
+                      <XAxis
+                        dataKey="run"
+                        tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
+                        tickLine={false}
+                        axisLine={{ stroke: "var(--border)" }}
+                      />
+                      <YAxis
+                        tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
+                        tickLine={false}
+                        axisLine={false}
+                      />
+                      <ChartTooltip
+                        cursor={{ fill: "var(--info)", fillOpacity: 0.08 }}
+                        contentStyle={{
+                          background: "oklch(0.18 0.03 260)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 8,
+                          fontSize: 11,
+                        }}
+                        labelFormatter={(l) => `Run ${l}`}
+                        formatter={(value) => [`${value} min`, "Delay"]}
+                      />
+                      <Bar
+                        dataKey="delay"
+                        fill="var(--warning)"
+                        radius={[4, 4, 0, 0]}
+                        maxBarSize={26}
+                        isAnimationActive={false}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+          )}
+        </Card>
+
         <div className="col-span-12 text-center text-[11px] text-muted-foreground font-mono-mc py-2">
-          RAILMIND · AUTONOMOUS RAILWAY OS · MVP DEMO
+          RAILMIND · AUTONOMOUS RAILWAY OS · LIVE DIGITAL TWIN
         </div>
       </main>
     </div>

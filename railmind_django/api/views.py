@@ -75,6 +75,8 @@ def get_state(request):
     if not twin:
         return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
+    # Living twin: state reads advance the simulation (no background thread)
+    twin.maybe_tick()
     state_dump = twin.get_state()
 
     graph_state = {
@@ -164,6 +166,35 @@ def close_track(request):
 
 
 @api_view(['POST'])
+def set_weather(request):
+    """
+    Set the weather condition on a specific track.
+
+    Used by the agent service to inject weather scenarios.
+
+    Example usage:
+    ```python
+    set_weather("T05", "STORM")
+    ```
+    """
+    twin = get_twin(request)
+    if not twin:
+        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
+    track_id = request.data.get("track_id")
+    condition = request.data.get("condition", "CLEAR")
+    if not track_id:
+        return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        twin.set_weather(track_id, str(condition).upper())
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({"status": "success", "track_id": track_id, "condition": str(condition).upper()})
+
+
+@api_view(['POST'])
 def find_route(request):
     """
     Calculate the optimal route between a source and a destination station.
@@ -220,7 +251,10 @@ def reroute_train(request):
     if train_id not in twin.state.trains:
         return Response({"error": "Train ID not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    twin.reroute_train(train_id, route)
+    try:
+        twin.reroute_train(train_id, route)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     return Response({"status": "success", "train_id": train_id, "route": route})
 
 

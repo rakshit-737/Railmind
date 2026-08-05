@@ -28,8 +28,10 @@ Master contract:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, TypedDict
@@ -38,7 +40,13 @@ import networkx as nx
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langgraph.graph import END, StateGraph
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
 # Make the repo root importable so the embedded twin fallback works offline.
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -81,20 +89,47 @@ MCDM_WEIGHTS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWIN SNAPSHOT ACQUISITION
+# TWIN ACCESS
+# The orchestrator talks to the first reachable twin API; when none is
+# reachable it falls back to an embedded in-process twin, so every endpoint
+# (including injections, apply-plan and reset) works fully offline.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _embedded_snapshot() -> dict:
-    """Build a snapshot from the bundled railmind package — no network needed."""
+_embedded_twin = None
+_embedded_lock = threading.Lock()
+
+# Cache of the reachable remote base (None = use embedded), refreshed periodically
+_twin_base_cache: dict = {"base": None, "checked_at": 0.0}
+_TWIN_BASE_TTL = 20.0
+
+
+def _get_embedded_twin():
+    global _embedded_twin
     from railmind.data_loader import load_railway
     from railmind.graph import build_network_from_data
     from railmind.twin import DigitalTwin
 
-    stations, tracks = load_railway("India")
-    graph = build_network_from_data(stations, tracks)
-    twin = DigitalTwin(graph)
-    twin.seed_trains(5)
+    with _embedded_lock:
+        if _embedded_twin is None:
+            stations, tracks = load_railway("India")
+            graph = build_network_from_data(stations, tracks)
+            twin = DigitalTwin(graph)
+            twin.seed_trains(5)
+            _embedded_twin = twin
+        return _embedded_twin
 
+
+def _reset_embedded_twin():
+    global _embedded_twin
+    with _embedded_lock:
+        _embedded_twin = None
+
+
+def _embedded_snapshot() -> dict:
+    """Snapshot from the in-process twin — no network needed. Ticks the twin
+    so trains move between reads even with no Django server running."""
+    twin = _get_embedded_twin()
+    twin.maybe_tick()
     dump = twin.get_state()
     dump["graph"] = {
         "nodes": list(twin.graph.graph.nodes()),
@@ -103,18 +138,72 @@ def _embedded_snapshot() -> dict:
     return dump
 
 
-def fetch_snapshot() -> tuple[dict, str]:
-    """Return (snapshot, source_label) from the first reachable twin."""
+def _twin_base() -> str | None:
+    """Return the first reachable remote twin base URL, or None for embedded."""
+    now = time.time()
+    if now - _twin_base_cache["checked_at"] < _TWIN_BASE_TTL:
+        return _twin_base_cache["base"]
+
+    base_found = None
     for base in TWIN_CANDIDATES:
         if not base:
             continue
+        try:
+            resp = requests.get(f"{base}/api/state/", timeout=3)
+            resp.raise_for_status()
+            base_found = base
+            break
+        except requests.RequestException:
+            continue
+
+    _twin_base_cache["base"] = base_found
+    _twin_base_cache["checked_at"] = now
+    return base_found
+
+
+def fetch_snapshot() -> tuple[dict, str]:
+    """Return (snapshot, source_label) from the live twin (remote or embedded)."""
+    base = _twin_base()
+    if base:
         try:
             resp = requests.get(f"{base}/api/state/", timeout=4)
             resp.raise_for_status()
             return resp.json(), base
         except requests.RequestException:
-            continue
+            _twin_base_cache["base"] = None
     return _embedded_snapshot(), "embedded"
+
+
+def _twin_close_track(track_id: str) -> None:
+    base = _twin_base()
+    if base:
+        requests.post(f"{base}/api/track/close/", json={"track_id": track_id}, timeout=4).raise_for_status()
+    else:
+        _get_embedded_twin().close_track(track_id)
+
+
+def _twin_set_weather(track_id: str, condition: str) -> None:
+    base = _twin_base()
+    if base:
+        requests.post(f"{base}/api/weather/set/", json={"track_id": track_id, "condition": condition}, timeout=4).raise_for_status()
+    else:
+        _get_embedded_twin().set_weather(track_id, condition)
+
+
+def _twin_reroute_train(train_id: str, route: List[str]) -> None:
+    base = _twin_base()
+    if base:
+        requests.post(f"{base}/api/train/reroute/", json={"train_id": train_id, "route": route}, timeout=4).raise_for_status()
+    else:
+        _get_embedded_twin().reroute_train(train_id, route)
+
+
+def _twin_reset() -> None:
+    base = _twin_base()
+    if base:
+        requests.post(f"{base}/api/reset/", timeout=6).raise_for_status()
+    else:
+        _reset_embedded_twin()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,8 +469,15 @@ def routing_node(state: RailState) -> RailState:
         if origin not in G:
             origin = route[0] if route else None
 
+        if origin == route[-1]:
+            # Already at the final stop — nothing to reroute; the return
+            # service gets planned on a later run once the train turns around.
+            continue
+
         try:
             new_route = nx.shortest_path(G, source=origin, target=route[-1])
+            if len(new_route) < 2:
+                continue
             routing_strategies.append({
                 "strategy_id": f"R_REROUTE_{train_id}",
                 "train_id": train_id,
@@ -704,6 +800,21 @@ def _plan_payload(result: dict, plan: dict) -> dict:
     if not action_labels:
         action_labels = ["Maintain nominal operations"]
 
+    # Per-plan map data so the console can preview any candidate plan
+    plan_failed = sorted({
+        a["track_id"] for a in plan["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("T_CLOSE_")
+    })
+    plan_rerouted = [
+        {"id": a["train_id"], "newRoute": a["new_route"]}
+        for a in plan["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("R_REROUTE_")
+    ]
+    plan_held = [
+        a["train_id"] for a in plan["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("R_HOLD_")
+    ]
+
     return {
         "id": result["plan_id"],
         "name": result["plan_name"],
@@ -713,7 +824,83 @@ def _plan_payload(result: dict, plan: dict) -> dict:
         "congestion": result["congestion"],
         "score": result["score"],
         "actions": action_labels,
+        "failed_tracks": plan_failed,
+        "rerouted_trains": plan_rerouted,
+        "held_trains": plan_held,
     }
+
+
+def _template_explanation(final: RailState) -> str:
+    """Deterministic explanation of the Master Agent's choice — no LLM needed."""
+    results = sorted(final["simulation_results"], key=lambda r: r["score"], reverse=True)
+    best, worst = results[0], results[-1]
+    reroutes = sum(
+        1 for s in final["routing_strategies"]
+        if s["strategy_id"].startswith("R_REROUTE_")
+    )
+    parts = [
+        f"{best['plan_name']} scored {best['score']}/100 — the best balance of "
+        f"delay ({best['delay']} min), residual risk ({best['risk']:.2f}), "
+        f"passenger impact ({best['passenger_impact']}) and congestion ({best['congestion']:.2f})."
+    ]
+    if reroutes:
+        parts.append(f"It keeps {reroutes} affected train(s) moving via alternate corridors.")
+    if worst["plan_id"] != best["plan_id"]:
+        parts.append(
+            f"{worst['plan_name']} was rejected (score {worst['score']}/100): "
+            f"{worst['delay']} min of delay and risk {worst['risk']:.2f} make it the costliest option."
+        )
+    return " ".join(parts)
+
+
+def _llm_explanation(final: RailState) -> str | None:
+    """Ask Claude for a dispatcher-style justification. Returns None when the
+    API key is absent or the call fails — callers fall back to the template."""
+    if anthropic is None or not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        # Hard budget: a slow LLM call must fall back to the template well
+        # inside the console's 8s POST / 60s SSE windows.
+        client = anthropic.Anthropic(timeout=8.0, max_retries=0)
+        summary = {
+            "candidate_plans": [
+                {k: r[k] for k in ("plan_id", "plan_name", "delay", "risk", "passenger_impact", "congestion", "score")}
+                for r in final["simulation_results"]
+            ],
+            "selected": final["best_plan"]["plan_id"],
+            "reroutes": [
+                {"train": s["train_id"], "new_route": s["new_route"]}
+                for s in final["routing_strategies"]
+                if s["strategy_id"].startswith("R_REROUTE_")
+            ],
+            "closed_tracks": [
+                s["track_id"] for s in final["track_strategies"]
+                if s["strategy_id"].startswith("T_CLOSE_")
+            ],
+        }
+        response = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=1024,
+            system=(
+                "You are the Master Agent of RailMind, a railway operations AI. "
+                "Given simulation results for candidate response plans, explain to a human "
+                "dispatcher in 2-3 plain sentences why the selected plan is the right call. "
+                "Be concrete about the tradeoffs. No preamble, no markdown."
+            ),
+            messages=[{"role": "user", "content": json.dumps(summary)}],
+        )
+        if response.stop_reason == "refusal":
+            return None
+        return next((b.text for b in response.content if b.type == "text"), None)
+    except Exception:
+        return None
+
+
+def _explanation(final: RailState) -> dict:
+    llm_text = _llm_explanation(final)
+    if llm_text:
+        return {"text": llm_text.strip(), "source": "claude"}
+    return {"text": _template_explanation(final), "source": "rules"}
 
 
 def _format_response(final: RailState, twin_source: str) -> dict:
@@ -756,6 +943,7 @@ def _format_response(final: RailState, twin_source: str) -> dict:
 
     return {
         "twin_source": twin_source,
+        "explanation": _explanation(final),
         "recommended_action": _plan_payload(best, plans_by_id[best["plan_id"]]),
         "candidate_plans": [
             _plan_payload(r, plans_by_id[r["plan_id"]])
@@ -798,8 +986,55 @@ def health():
     return {
         "service": "RailMind Agents",
         "status": "ok",
-        "endpoints": ["/run", "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}", "/docs"],
+        "endpoints": [
+            "/state", "/run", "/run-stream", "/apply-plan", "/reset",
+            "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}", "/docs",
+        ],
     }
+
+
+@app.get("/state")
+def live_state():
+    """Live twin snapshot for the console's polling loop (trains move each tick)."""
+    snapshot, source = fetch_snapshot()
+    trains = [
+        {
+            "id": tid,
+            "route": t.get("route", []),
+            "passengers": t.get("passengers", 0),
+            "current_station": t.get("current_station"),
+            "route_index": t.get("route_index", 0),
+            "progress": t.get("progress", 0.0),
+            "held": t.get("held", False),
+            "delayed_minutes": round(t.get("delayed_minutes", 0.0), 1),
+        }
+        for tid, t in snapshot.get("trains", {}).items()
+    ]
+    tracks = [
+        {
+            "id": tid,
+            "health": t.get("health", 1.0),
+            "status": t.get("status", "OPEN"),
+            "source": t.get("source"),
+            "destination": t.get("destination"),
+        }
+        for tid, t in snapshot.get("tracks", {}).items()
+    ]
+    weather = {
+        tid: (c.value if hasattr(c, "value") else str(c))
+        for tid, c in (snapshot.get("weather") or {}).items()
+    } if isinstance(snapshot.get("weather"), dict) else {}
+    return {"twin_source": source, "trains": trains, "tracks": tracks, "weather": weather}
+
+
+@app.post("/reset")
+def reset():
+    """Reset the twin to its baseline state (clears failures, weather, reroutes)."""
+    try:
+        _twin_reset()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin reset failed: {e}")
+    return {"status": "success", "message": "Twin reset to baseline."}
 
 
 @app.post("/run")
@@ -810,23 +1045,87 @@ def run_pipeline():
     return _format_response(final, source)
 
 
-@app.post("/simulate-track-failure/{track_id}")
-def simulate_track_failure(track_id: str):
-    """Inject a track failure and run the full pipeline against it."""
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.get("/run-stream")
+def run_pipeline_stream(inject_track: str | None = None, weather_track: str | None = None,
+                        condition: str = "STORM"):
+    """Run the pipeline and stream agent log events live over SSE.
+
+    Optional query params apply an injection first (persistently, like the
+    POST endpoints): ?inject_track=T23 or ?weather_track=T05&condition=STORM.
+    """
+    known_tracks = fetch_snapshot()[0].get("tracks", {})
+    for tid in (inject_track, weather_track):
+        if tid and tid not in known_tracks:
+            raise HTTPException(status_code=404, detail=f"Track '{tid}' not found.")
+
+    extra_log: List[dict] = []
+    try:
+        if inject_track:
+            _twin_close_track(inject_track)
+            extra_log.append({"t": time.strftime("%H:%M:%S"), "source": "Sensor",
+                              "message": f"[INJECTED] Track {inject_track} failure detected — closed"})
+        if weather_track:
+            cond = condition.upper()
+            if cond in WEATHER_CONDITION_RISK:
+                _twin_set_weather(weather_track, cond)
+                extra_log.append({"t": time.strftime("%H:%M:%S"), "source": "Sensor",
+                                  "message": f"[INJECTED] {cond} reported on track {weather_track}"})
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+
     snapshot, source = fetch_snapshot()
 
-    tracks = snapshot.get("tracks", {})
-    if track_id not in tracks:
+    def event_stream():
+        state = _initial_state(snapshot, extra_log=list(extra_log))
+        emitted = 0
+        for entry in extra_log:
+            yield _sse("log", entry)
+            emitted += 1
+
+        final_state = dict(state)
+        for update in pipeline.stream(state):
+            for node_state in update.values():
+                if not isinstance(node_state, dict):
+                    continue
+                final_state.update(node_state)
+                log = final_state.get("log", [])
+                while emitted < len(log):
+                    yield _sse("log", log[emitted])
+                    emitted += 1
+                    time.sleep(0.15)  # let the timeline animate
+
+        yield _sse("result", _format_response(final_state, source))
+        yield _sse("done", {})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/simulate-track-failure/{track_id}")
+def simulate_track_failure(track_id: str):
+    """Inject a persistent track failure into the twin and run the pipeline.
+
+    Failures accumulate — inject several tracks to build a cascade scenario.
+    Use /reset to return to baseline.
+    """
+    snapshot, _ = fetch_snapshot()
+    if track_id not in snapshot.get("tracks", {}):
         raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
 
-    # Inject failure — force health to 0
-    snapshot["tracks"][track_id]["health"] = 0.0
-    snapshot["tracks"][track_id]["status"] = "CLOSED"
+    try:
+        _twin_close_track(track_id)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
 
+    snapshot, source = fetch_snapshot()
     injected_log = [{
         "t": time.strftime("%H:%M:%S"),
         "source": "Sensor",
-        "message": f"[INJECTED] Track {track_id} failure detected — health 0.0",
+        "message": f"[INJECTED] Track {track_id} failure detected — closed",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
     return {"injected_failure": track_id, **_format_response(final, source)}
@@ -834,7 +1133,7 @@ def simulate_track_failure(track_id: str):
 
 @app.post("/simulate-weather/{track_id}")
 def simulate_weather(track_id: str, condition: str = "STORM"):
-    """Inject severe weather on a track and run the full pipeline against it."""
+    """Inject persistent severe weather on a track and run the pipeline."""
     condition = condition.upper()
     if condition not in WEATHER_CONDITION_RISK:
         raise HTTPException(
@@ -842,18 +1141,16 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
             detail=f"Unknown condition '{condition}'. Use one of {list(WEATHER_CONDITION_RISK)}.",
         )
 
-    snapshot, source = fetch_snapshot()
-
-    tracks = snapshot.get("tracks", {})
-    if track_id not in tracks:
+    snapshot, _ = fetch_snapshot()
+    if track_id not in snapshot.get("tracks", {}):
         raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
 
-    weather = snapshot.get("weather") or {}
-    if not isinstance(weather, dict):
-        weather = {}
-    weather[track_id] = condition
-    snapshot["weather"] = weather
+    try:
+        _twin_set_weather(track_id, condition)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
 
+    snapshot, source = fetch_snapshot()
     injected_log = [{
         "t": time.strftime("%H:%M:%S"),
         "source": "Sensor",
@@ -861,4 +1158,44 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
     return {"injected_weather": {"track_id": track_id, "condition": condition},
+            **_format_response(final, source)}
+
+
+@app.post("/apply-plan")
+def apply_plan(plan_id: str | None = None):
+    """Close the loop: run the pipeline, then execute the chosen plan on the twin.
+
+    Closes flagged tracks and applies the plan's reroutes so the living twin
+    reflects the decision — trains follow their new routes on subsequent ticks.
+    Defaults to the Master Agent's recommended plan.
+    """
+    snapshot, source = fetch_snapshot()
+    final = pipeline.invoke(_initial_state(snapshot))
+
+    target_id = (plan_id or final["best_plan"]["plan_id"]).upper()
+    plan = next((p for p in final["plans"] if p["plan_id"] == target_id), None)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"Plan '{target_id}' not found.")
+
+    applied = []
+    try:
+        for action in plan["actions"]:
+            if not isinstance(action, dict):
+                continue
+            sid = action.get("strategy_id", "")
+            if sid.startswith("T_CLOSE_"):
+                _twin_close_track(action["track_id"])
+                applied.append(f"Closed track {action['track_id']}")
+            elif sid.startswith("R_REROUTE_"):
+                _twin_reroute_train(action["train_id"], action["new_route"])
+                applied.append(f"Rerouted {action['train_id']}")
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable while applying plan: {e}")
+
+    final["log"].append({
+        "t": time.strftime("%H:%M:%S"),
+        "source": "Executor",
+        "message": f"Plan {target_id} executed on the live twin: {len(applied)} action(s)",
+    })
+    return {"executed_plan": target_id, "applied_actions": applied,
             **_format_response(final, source)}

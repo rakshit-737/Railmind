@@ -21,3 +21,4 @@ railmind/data/osm_cache.json
 .opencode/
 .vscode/
 .idea/
+.claude/

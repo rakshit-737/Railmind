@@ -14,6 +14,12 @@ export type Train = {
   id: string;
   route: string[];
   passengers: number;
+  // Live-twin fields (present when the backend is reachable)
+  current_station?: string | null;
+  route_index?: number;
+  progress?: number; // 0..1 along the edge to the next station
+  held?: boolean;
+  delayed_minutes?: number;
 };
 
 const RAW_STATIONS: { id: string; name: string; lat: number; lon: number }[] = [

@@ -7,6 +7,14 @@ type Props = {
   reroutedTrains?: { id: string; newRoute: string[] }[];
   highlightedRoute?: string[] | null;
   highlightedTrainId?: string | null;
+  weather?: Record<string, string>;
+  previewLabel?: string | null;
+};
+
+const WEATHER_GLYPH: Record<string, string> = {
+  STORM: "⛈",
+  RAIN: "🌧",
+  FOG: "🌫",
 };
 
 export function NetworkMap({
@@ -15,6 +23,8 @@ export function NetworkMap({
   reroutedTrains = [],
   highlightedRoute = null,
   highlightedTrainId = null,
+  weather = {},
+  previewLabel = null,
 }: Props) {
   const [hoverStation, setHoverStation] = useState<string | null>(null);
   const [hoverTrack, setHoverTrack] = useState<string | null>(null);
@@ -38,6 +48,44 @@ export function NetworkMap({
     if (status === "monitored") return "var(--warning)";
     return "var(--success)";
   }
+
+  // Live train positions: interpolate between the current station and the next
+  const trainDots = trains
+    .map((t) => {
+      const idx = t.route_index ?? 0;
+      const cur = stationById[t.current_station ?? t.route[idx] ?? ""];
+      if (!cur) return null;
+      const next = stationById[t.route[idx + 1] ?? ""];
+      const p = Math.max(0, Math.min(1, t.progress ?? 0));
+      const x = next ? cur.x + (next.x - cur.x) * p : cur.x;
+      const y = next ? cur.y + (next.y - cur.y) * p : cur.y;
+      return { id: t.id, x, y, held: !!t.held };
+    })
+    .filter((d): d is { id: string; x: number; y: number; held: boolean } => d !== null);
+
+  // Weather markers at the midpoint of the affected track
+  const weatherMarks = Object.entries(weather)
+    .map(([trackId, condition]) => {
+      const t = TRACKS.find((x) => x.id === trackId);
+      if (!t) return null;
+      const a = stationById[t.from];
+      const b = stationById[t.to];
+      if (!a || !b) return null;
+      return {
+        trackId,
+        condition,
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2,
+        glyph: WEATHER_GLYPH[condition] ?? "🌧",
+      };
+    })
+    .filter(Boolean) as {
+    trackId: string;
+    condition: string;
+    x: number;
+    y: number;
+    glyph: string;
+  }[];
 
   const hoveredStation = hoverStation ? stationById[hoverStation] : null;
   const stationTracks = hoveredStation
@@ -177,6 +225,54 @@ export function NetworkMap({
             );
           })()}
 
+        {/* Weather markers */}
+        {weatherMarks.map((w) => (
+          <g key={`w-${w.trackId}`}>
+            <circle
+              cx={w.x}
+              cy={w.y}
+              r={11}
+              fill="oklch(0.2 0.03 260 / 0.85)"
+              stroke="var(--info)"
+              strokeWidth={1}
+              strokeOpacity={0.5}
+            />
+            <text x={w.x} y={w.y + 4} textAnchor="middle" fontSize={12}>
+              {w.glyph}
+            </text>
+          </g>
+        ))}
+
+        {/* Live trains */}
+        {trainDots.map((d) => (
+          <g
+            key={`train-${d.id}`}
+            style={{
+              transform: `translate(${d.x}px, ${d.y}px)`,
+              transition: "transform 1.4s linear",
+            }}
+          >
+            <circle
+              r={5.5}
+              fill={d.held ? "var(--danger)" : "var(--info)"}
+              stroke="oklch(0.14 0.02 260)"
+              strokeWidth={1.5}
+              className={d.held ? "pulse-dot" : undefined}
+              style={{ filter: `drop-shadow(0 0 6px ${d.held ? "var(--danger)" : "var(--info)"})` }}
+            />
+            <text
+              x={8}
+              y={-6}
+              fill={d.held ? "var(--danger)" : "var(--info)"}
+              fontSize={9}
+              className="font-mono-mc"
+              fontWeight={700}
+            >
+              {d.id}
+            </text>
+          </g>
+        ))}
+
         {/* Stations */}
         {STATIONS.map((s) => {
           const active = hoverStation === s.id;
@@ -210,6 +306,13 @@ export function NetworkMap({
           );
         })}
       </svg>
+
+      {/* Plan preview badge */}
+      {previewLabel && (
+        <div className="absolute left-3 top-3 glass rounded-md px-3 py-1.5 text-[11px] font-mono-mc text-info border border-info/40">
+          PREVIEW · {previewLabel}
+        </div>
+      )}
 
       {/* Legend */}
       <div className="absolute right-3 bottom-3 glass rounded-md px-3 py-2 text-[11px] font-mono-mc flex gap-3 items-center">

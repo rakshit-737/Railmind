@@ -47,6 +47,16 @@ All layers share one canonical network — [`railmind/data/india_network.json`](
 
 ## Quickstart
 
+### Option A — one command (Docker)
+
+```bash
+docker compose up
+```
+
+Twin on :8000, agents on :8001, console on http://localhost:8080. Set `ANTHROPIC_API_KEY` in your environment first if you want Claude-written plan explanations.
+
+### Option B — local dev (three terminals)
+
 Prerequisites: **Python 3.11+**, **Node 20+**.
 
 ### 1. Digital twin (Django) — port 8000
@@ -90,18 +100,18 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 
 ---
 
-## Demo script (2 minutes)
+## Demo script (3 minutes)
 
-1. Open the console — the live map shows the 21-station network with per-track health.
-2. Click **Run Full Simulation** — agents evaluate the healthy network; Master Agent recommends minimal intervention.
-3. Select track **T23 · Nagpur ↔ Raipur** and click **Inject Failure** — watch:
-   - Incident panel flips to **ACTIVE** with affected trains + passengers,
-   - the failed track turns red, rerouted trains draw blue alternate paths,
-   - each agent card fills with its decisions,
-   - three candidate plans appear, scored 0–100, best one highlighted,
-   - the Agent Timeline replays the whole pipeline event by event.
-4. Click **Storm** — the Weather Agent escalates to the emergency protocol (W1) and signals react.
-5. URL shortcuts for instant demos: `/?autorun` runs the pipeline on load, `/?inject=T23` injects a failure on load.
+1. Open the console — the twin is **alive**: trains glide along real corridors, weather rolls in and clears, congestion drifts. No clicks needed.
+2. Select track **T23 · Nagpur ↔ Raipur** and click **Inject Failure** — watch:
+   - agent decisions **stream into the timeline live** as the pipeline thinks,
+   - the failed track turns red; any train approaching it is **HELD** (red, delay accruing),
+   - three candidate plans appear, scored 0–100 — **click each one to preview** its closures and reroutes on the map,
+   - the Master Agent explains its choice in plain language (Claude-written when `ANTHROPIC_API_KEY` is set).
+3. Click **Execute Recommended Plan on Live Twin** — reroutes are applied to the real twin. Held trains start moving along their alternate corridors within seconds; re-running the pipeline confirms nothing is left to fix. The loop is closed.
+4. Stack a cascade: inject a second failure, then click **Storm** — scenarios accumulate and the plans get harder. The **Run Analytics** panel charts score and delay across your runs.
+5. The **↺** button resets the twin to baseline between demos.
+6. URL shortcuts: `/?autorun` runs the pipeline on load, `/?inject=T23` injects a failure on load.
 
 ---
 
@@ -125,10 +135,15 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 | Twin | `GET /api/state/` | Full network snapshot (tracks, trains, weather, graph) |
 | Twin | `POST /api/copy/` | Clone the twin into a sandbox "future" session |
 | Twin | `POST /api/track/close/` · `POST /api/route/find/` | Mutate / query the twin |
+| Twin | `POST /api/weather/set/` | Set weather on a track |
 | Twin | `POST /api/reset/` | Rebuild baseline twin between demos |
+| Agents | `GET /state` | Live twin snapshot (the console polls this — trains move each tick) |
 | Agents | `POST /run` | Run the full pipeline on the live twin |
-| Agents | `POST /simulate-track-failure/{track_id}` | Inject a failure, then run the pipeline |
-| Agents | `POST /simulate-weather/{track_id}?condition=STORM` | Inject weather, then run the pipeline |
+| Agents | `GET /run-stream` | Same, streaming agent decisions over SSE (`?inject_track=`, `?weather_track=`) |
+| Agents | `POST /simulate-track-failure/{track_id}` | Persistently close a track, then run the pipeline (failures stack) |
+| Agents | `POST /simulate-weather/{track_id}?condition=STORM` | Persistently inject weather, then run the pipeline |
+| Agents | `POST /apply-plan` | Execute a plan on the live twin (closes tracks, applies reroutes) |
+| Agents | `POST /reset` | Reset the twin to baseline |
 
 ---
 
@@ -143,5 +158,17 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 | Variable | Where | Default | Effect |
 |---|---|---|---|
 | `TWIN_BASE_URL` | agents | auto-discover | Point the orchestrator at a specific twin |
+| `ANTHROPIC_API_KEY` | agents | unset | Claude-written plan explanations (rule-engine fallback otherwise) |
 | `VITE_API_BASE_URL` | console | `http://127.0.0.1:8001` | Agent service URL |
 | `RAILMIND_LIVE_OSM` | core | off | Load the real network from OpenStreetMap (Overpass) instead of the bundled dataset; results are cached, failures fall back offline |
+
+---
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -q
+```
+
+CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.

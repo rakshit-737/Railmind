@@ -31,13 +31,20 @@ export type Plan = {
   congestion: number;
   score: number; // 0-100, higher is better
   actions: string[];
+  // Per-plan map preview data (real backend)
+  failed_tracks?: string[];
+  rerouted_trains?: { id: string; newRoute: string[] }[];
+  held_trains?: string[];
 };
 
 export type LogEvent = { t: string; source: string; message: string };
 
+export type Explanation = { text: string; source: "claude" | "rules" | string };
+
 export type RunResponse = {
   injected_failure?: string;
   twin_source?: string;
+  explanation?: Explanation;
   recommended_action: Plan;
   candidate_plans: Plan[];
   agent_outputs: AgentOutputs;
@@ -46,6 +53,23 @@ export type RunResponse = {
   rerouted_trains: { id: string; newRoute: string[] }[];
   held_trains?: string[];
   trains?: Train[];
+  executed_plan?: string;
+  applied_actions?: string[];
+};
+
+export type LiveTrack = {
+  id: string;
+  health: number;
+  status: string;
+  source?: string;
+  destination?: string;
+};
+
+export type LiveState = {
+  twin_source: string;
+  trains: Train[];
+  tracks: LiveTrack[];
+  weather: Record<string, string>;
 };
 
 const API_BASE_URL: string =
@@ -112,6 +136,9 @@ function buildMockRun(trackId?: string): RunResponse {
         `Signal RED on ${failed}`,
         ...affected.map((a) => `Reroute ${a.id}`),
       ],
+      failed_tracks: [failed],
+      rerouted_trains: reroutes.map((r) => ({ id: r.train, newRoute: r.to })),
+      held_trains: [],
     },
     {
       id: "B",
@@ -126,6 +153,9 @@ function buildMockRun(trackId?: string): RunResponse {
         `Signal YELLOW on ${failed}`,
         ...affected.map((a) => `Reroute ${a.id}`),
       ],
+      failed_tracks: [],
+      rerouted_trains: reroutes.map((r) => ({ id: r.train, newRoute: r.to })),
+      held_trains: [],
     },
     {
       id: "C",
@@ -136,6 +166,9 @@ function buildMockRun(trackId?: string): RunResponse {
       congestion: 0.7,
       score: 21,
       actions: [`Monitor ${failed}`, "Keep all signals GREEN", "No reroutes"],
+      failed_tracks: [],
+      rerouted_trains: [],
+      held_trains: [],
     },
   ];
 
@@ -176,6 +209,13 @@ function buildMockRun(trackId?: string): RunResponse {
   return {
     injected_failure: trackId,
     twin_source: "mock (offline)",
+    explanation: {
+      text:
+        `${recommended.name} scored ${recommended.score}/100 — it reroutes ${reroutes.length} ` +
+        `affected train(s) around ${failed} (${fromName} ↔ ${toName}) while keeping delay at ` +
+        `${recommended.delay_min} min. Minimal intervention would strand passengers on a dead section.`,
+      source: "rules",
+    },
     recommended_action: recommended,
     candidate_plans: plans,
     agent_outputs,
@@ -237,6 +277,117 @@ export async function runSimulation(): Promise<RunResponse> {
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
   return buildMockRun();
+}
+
+/** Live twin snapshot for the polling loop. Null when the backend is offline. */
+export async function fetchLiveState(): Promise<LiveState | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch(`${API_BASE_URL}/state`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json = (await res.json()) as LiveState;
+    return Array.isArray(json.trains) && Array.isArray(json.tracks) ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function applyPlan(planId?: string): Promise<RunResponse | null> {
+  const url = planId
+    ? `${API_BASE_URL}/apply-plan?plan_id=${encodeURIComponent(planId)}`
+    : `${API_BASE_URL}/apply-plan`;
+  return tryFetch(url, { method: "POST" });
+}
+
+export async function resetTwin(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/reset`, { method: "POST" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export type StreamParams = {
+  injectTrack?: string;
+  weatherTrack?: string;
+  condition?: string;
+};
+
+export type StreamOutcome = {
+  result: RunResponse | null;
+  /**
+   * True when the backend received the request (any SSE event arrived). An
+   * injection has then already been applied server-side — a caller that wants
+   * a fallback must use plain /run, never the injecting endpoints again.
+   */
+  sawEvents: boolean;
+};
+
+/**
+ * Run the pipeline with live SSE log streaming. Calls onLog per agent event.
+ * Resolves with the final response plus whether the stream ever delivered
+ * anything (see StreamOutcome for the re-injection contract).
+ */
+export function runSimulationStream(
+  onLog: (e: LogEvent) => void,
+  params: StreamParams = {},
+): Promise<StreamOutcome> {
+  return new Promise((resolve) => {
+    if (typeof EventSource === "undefined") {
+      resolve({ result: null, sawEvents: false });
+      return;
+    }
+    const qs = new URLSearchParams();
+    if (params.injectTrack) qs.set("inject_track", params.injectTrack);
+    if (params.weatherTrack) {
+      qs.set("weather_track", params.weatherTrack);
+      qs.set("condition", params.condition ?? "STORM");
+    }
+    const url = `${API_BASE_URL}/run-stream${qs.size ? `?${qs}` : ""}`;
+
+    let settled = false;
+    let sawEvents = false;
+    let result: RunResponse | null = null;
+    const source = new EventSource(url);
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      source.close();
+      resolve({ result, sawEvents });
+    };
+
+    const guard = setTimeout(finish, 60000);
+
+    source.addEventListener("log", (ev) => {
+      sawEvents = true;
+      try {
+        onLog(JSON.parse((ev as MessageEvent).data) as LogEvent);
+      } catch {
+        // ignore malformed log frames
+      }
+    });
+    source.addEventListener("result", (ev) => {
+      sawEvents = true;
+      try {
+        const parsed: unknown = JSON.parse((ev as MessageEvent).data);
+        if (isValidRunResponse(parsed)) result = normalize(parsed);
+      } catch {
+        result = null;
+      }
+    });
+    source.addEventListener("done", () => {
+      clearTimeout(guard);
+      finish();
+    });
+    source.onerror = () => {
+      clearTimeout(guard);
+      finish();
+    };
+  });
 }
 
 export async function injectTrackFailure(trackId: string): Promise<RunResponse> {

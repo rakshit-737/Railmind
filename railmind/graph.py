@@ -38,6 +38,8 @@ class RailwayGraph:
             return nx.shortest_path(self.graph, source=source, target=destination, weight=weight_func)
         except nx.NetworkXNoPath:
             raise ValueError(f"No path found between {source} and {destination}")
+        except nx.NodeNotFound:
+            raise ValueError(f"Unknown station: {source if source not in self.graph else destination}")
 
     def get_graph_snapshot(self):
         nodes = []
