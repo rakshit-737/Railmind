@@ -96,10 +96,14 @@ MCDM_WEIGHTS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _embedded_twin = None
-_embedded_lock = threading.Lock()
+# Reentrant: serializes ALL embedded-twin access (construction, tick+dump,
+# mutation) — FastAPI's threadpool runs sync endpoints truly concurrently.
+_embedded_lock = threading.RLock()
 
-# Cache of the reachable remote base (None = use embedded), refreshed periodically
-_twin_base_cache: dict = {"base": None, "checked_at": 0.0}
+# Cache of the reachable remote base (None = use embedded), refreshed
+# periodically. "snapshot" holds the probe's parsed body so fetch_snapshot()
+# can consume it once instead of re-GETting the same URL.
+_twin_base_cache: dict = {"base": None, "snapshot": None, "checked_at": 0.0}
 _TWIN_BASE_TTL = 20.0
 
 
@@ -128,13 +132,14 @@ def _reset_embedded_twin():
 def _embedded_snapshot() -> dict:
     """Snapshot from the in-process twin — no network needed. Ticks the twin
     so trains move between reads even with no Django server running."""
-    twin = _get_embedded_twin()
-    twin.maybe_tick()
-    dump = twin.get_state()
-    dump["graph"] = {
-        "nodes": list(twin.graph.graph.nodes()),
-        "edges": list(twin.graph.graph.edges()),
-    }
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        twin.maybe_tick()
+        dump = twin.get_state()
+        dump["graph"] = {
+            "nodes": list(twin.graph.graph.nodes()),
+            "edges": list(twin.graph.graph.edges()),
+        }
     return dump
 
 
@@ -145,26 +150,48 @@ def _twin_base() -> str | None:
         return _twin_base_cache["base"]
 
     base_found = None
+    probe_snapshot = None
     for base in TWIN_CANDIDATES:
         if not base:
             continue
         try:
-            resp = requests.get(f"{base}/api/state/", timeout=3)
+            # Keep the probe well under the console's /state fetch timeout so a
+            # dead candidate can't make live polling fail over to the mock fleet
+            resp = requests.get(f"{base}/api/state/", timeout=1.5)
             resp.raise_for_status()
+            body = resp.json()
+            # A foreign server squatting a candidate port can 200 here; only a
+            # real twin snapshot (trains + tracks) qualifies as a base.
+            if not isinstance(body, dict) or "trains" not in body or "tracks" not in body:
+                continue
+            probe_snapshot = body
             base_found = base
             break
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             continue
 
     _twin_base_cache["base"] = base_found
+    _twin_base_cache["snapshot"] = probe_snapshot
     _twin_base_cache["checked_at"] = now
     return base_found
+
+
+def _drop_probe_snapshot() -> None:
+    # A probe body captured before a mutation must not be served after it.
+    _twin_base_cache["snapshot"] = None
 
 
 def fetch_snapshot() -> tuple[dict, str]:
     """Return (snapshot, source_label) from the live twin (remote or embedded)."""
     base = _twin_base()
     if base:
+        # A fresh probe already fetched this state — consume it once instead of
+        # re-GETting the same URL (probe + fetch would exceed the console's
+        # 5s /state abort and flip the UI to mock).
+        snapshot = _twin_base_cache["snapshot"]
+        if snapshot is not None:
+            _twin_base_cache["snapshot"] = None
+            return snapshot, base
         try:
             resp = requests.get(f"{base}/api/state/", timeout=4)
             resp.raise_for_status()
@@ -178,32 +205,40 @@ def _twin_close_track(track_id: str) -> None:
     base = _twin_base()
     if base:
         requests.post(f"{base}/api/track/close/", json={"track_id": track_id}, timeout=4).raise_for_status()
+        _drop_probe_snapshot()
     else:
-        _get_embedded_twin().close_track(track_id)
+        with _embedded_lock:
+            _get_embedded_twin().close_track(track_id)
 
 
 def _twin_set_weather(track_id: str, condition: str) -> None:
     base = _twin_base()
     if base:
         requests.post(f"{base}/api/weather/set/", json={"track_id": track_id, "condition": condition}, timeout=4).raise_for_status()
+        _drop_probe_snapshot()
     else:
-        _get_embedded_twin().set_weather(track_id, condition)
+        with _embedded_lock:
+            _get_embedded_twin().set_weather(track_id, condition)
 
 
 def _twin_reroute_train(train_id: str, route: List[str]) -> None:
     base = _twin_base()
     if base:
         requests.post(f"{base}/api/train/reroute/", json={"train_id": train_id, "route": route}, timeout=4).raise_for_status()
+        _drop_probe_snapshot()
     else:
-        _get_embedded_twin().reroute_train(train_id, route)
+        with _embedded_lock:
+            _get_embedded_twin().reroute_train(train_id, route)
 
 
 def _twin_reset() -> None:
+    # Always clear the embedded twin too — injections made while remotes were
+    # unreachable must not resurface after a later fallback flip.
+    _reset_embedded_twin()
     base = _twin_base()
     if base:
         requests.post(f"{base}/api/reset/", timeout=6).raise_for_status()
-    else:
-        _reset_embedded_twin()
+        _drop_probe_snapshot()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +672,21 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
             if train_id in trains:
                 passenger_impact += trains[train_id].get("passengers", 0)
 
+        elif strategy.startswith("W"):
+            # Weather protocols: closing the stormy track trades delay and
+            # congestion for weather risk; speed limits trade less of each.
+            for act in action.get("actions", []):
+                if act.startswith("close_track_"):
+                    delay += 20
+                    risk -= 0.15
+                    congestion += 0.10
+                elif act.startswith("reduce_speed_40kmh_"):
+                    delay += 10
+                    risk -= 0.08
+                elif act.startswith("reduce_speed_60kmh_"):
+                    delay += 5
+                    risk -= 0.04
+
     # Trains left running toward a failed track with no reroute/hold in this
     # plan are stranded: heavy delay, full passenger impact, elevated risk.
     if failed_edges:
@@ -860,8 +910,8 @@ def _llm_explanation(final: RailState) -> str | None:
         return None
     try:
         # Hard budget: a slow LLM call must fall back to the template well
-        # inside the console's 8s POST / 60s SSE windows.
-        client = anthropic.Anthropic(timeout=8.0, max_retries=0)
+        # inside the console's request windows.
+        client = anthropic.Anthropic(timeout=6.0, max_retries=0)
         summary = {
             "candidate_plans": [
                 {k: r[k] for k in ("plan_id", "plan_name", "delay", "risk", "passenger_impact", "congestion", "score")}
@@ -896,14 +946,14 @@ def _llm_explanation(final: RailState) -> str | None:
         return None
 
 
-def _explanation(final: RailState) -> dict:
-    llm_text = _llm_explanation(final)
+def _explanation(final: RailState, use_llm: bool = True) -> dict:
+    llm_text = _llm_explanation(final) if use_llm else None
     if llm_text:
         return {"text": llm_text.strip(), "source": "claude"}
     return {"text": _template_explanation(final), "source": "rules"}
 
 
-def _format_response(final: RailState, twin_source: str) -> dict:
+def _format_response(final: RailState, twin_source: str, use_llm: bool = True) -> dict:
     best = final["best_plan"]
     plans_by_id = {p["plan_id"]: p for p in final["plans"]}
 
@@ -943,7 +993,7 @@ def _format_response(final: RailState, twin_source: str) -> dict:
 
     return {
         "twin_source": twin_source,
-        "explanation": _explanation(final),
+        "explanation": _explanation(final, use_llm=use_llm),
         "recommended_action": _plan_payload(best, plans_by_id[best["plan_id"]]),
         "candidate_plans": [
             _plan_payload(r, plans_by_id[r["plan_id"]])
@@ -975,6 +1025,23 @@ def _format_response(final: RailState, twin_source: str) -> dict:
         "held_trains": held_trains,
         "trains": trains,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAST RUN CACHE
+# /apply-plan must execute exactly the plan the operator approved — the twin
+# keeps ticking after plans are displayed, so recomputing would silently swap
+# in a different plan under the same letter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_last_run: dict = {"final": None, "twin_source": None, "ts": 0.0}
+_LAST_RUN_TTL = 600.0
+
+
+def _record_run(final: RailState, twin_source: str) -> None:
+    _last_run["final"] = final
+    _last_run["twin_source"] = twin_source
+    _last_run["ts"] = time.time()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1042,6 +1109,7 @@ def run_pipeline():
     """Fetch the digital twin state and run the full agent pipeline."""
     snapshot, source = fetch_snapshot()
     final = pipeline.invoke(_initial_state(snapshot))
+    _record_run(final, source)
     return _format_response(final, source)
 
 
@@ -1057,6 +1125,13 @@ def run_pipeline_stream(inject_track: str | None = None, weather_track: str | No
     Optional query params apply an injection first (persistently, like the
     POST endpoints): ?inject_track=T23 or ?weather_track=T05&condition=STORM.
     """
+    condition = condition.upper()
+    if weather_track and condition not in WEATHER_CONDITION_RISK:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown condition '{condition}'. Use one of {list(WEATHER_CONDITION_RISK)}.",
+        )
+
     known_tracks = fetch_snapshot()[0].get("tracks", {})
     for tid in (inject_track, weather_track):
         if tid and tid not in known_tracks:
@@ -1069,37 +1144,43 @@ def run_pipeline_stream(inject_track: str | None = None, weather_track: str | No
             extra_log.append({"t": time.strftime("%H:%M:%S"), "source": "Sensor",
                               "message": f"[INJECTED] Track {inject_track} failure detected — closed"})
         if weather_track:
-            cond = condition.upper()
-            if cond in WEATHER_CONDITION_RISK:
-                _twin_set_weather(weather_track, cond)
-                extra_log.append({"t": time.strftime("%H:%M:%S"), "source": "Sensor",
-                                  "message": f"[INJECTED] {cond} reported on track {weather_track}"})
+            _twin_set_weather(weather_track, condition)
+            extra_log.append({"t": time.strftime("%H:%M:%S"), "source": "Sensor",
+                              "message": f"[INJECTED] {condition} reported on track {weather_track}"})
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
 
     snapshot, source = fetch_snapshot()
 
     def event_stream():
-        state = _initial_state(snapshot, extra_log=list(extra_log))
-        emitted = 0
-        for entry in extra_log:
-            yield _sse("log", entry)
-            emitted += 1
+        try:
+            state = _initial_state(snapshot, extra_log=list(extra_log))
+            emitted = 0
+            for entry in extra_log:
+                yield _sse("log", entry)
+                emitted += 1
 
-        final_state = dict(state)
-        for update in pipeline.stream(state):
-            for node_state in update.values():
-                if not isinstance(node_state, dict):
-                    continue
-                final_state.update(node_state)
-                log = final_state.get("log", [])
-                while emitted < len(log):
-                    yield _sse("log", log[emitted])
-                    emitted += 1
-                    time.sleep(0.15)  # let the timeline animate
+            final_state = dict(state)
+            for update in pipeline.stream(state):
+                for node_state in update.values():
+                    if not isinstance(node_state, dict):
+                        continue
+                    final_state.update(node_state)
+                    log = final_state.get("log", [])
+                    while emitted < len(log):
+                        yield _sse("log", log[emitted])
+                        emitted += 1
+                        time.sleep(0.15)  # let the timeline animate
 
-        yield _sse("result", _format_response(final_state, source))
-        yield _sse("done", {})
+            payload = _format_response(final_state, source)
+            _record_run(final_state, source)
+            yield _sse("result", payload)
+            yield _sse("done", {})
+        except Exception as e:
+            # A mid-stream crash must not end the stream silently — the console
+            # would just see the connection drop with no explanation.
+            yield _sse("error", {"t": time.strftime("%H:%M:%S"), "source": "System",
+                                 "message": f"pipeline failed: {e}"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1128,6 +1209,7 @@ def simulate_track_failure(track_id: str):
         "message": f"[INJECTED] Track {track_id} failure detected — closed",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
+    _record_run(final, source)
     return {"injected_failure": track_id, **_format_response(final, source)}
 
 
@@ -1157,20 +1239,31 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
         "message": f"[INJECTED] {condition} reported on track {track_id}",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
+    _record_run(final, source)
     return {"injected_weather": {"track_id": track_id, "condition": condition},
             **_format_response(final, source)}
 
 
 @app.post("/apply-plan")
 def apply_plan(plan_id: str | None = None):
-    """Close the loop: run the pipeline, then execute the chosen plan on the twin.
+    """Close the loop: execute the chosen plan on the twin.
 
-    Closes flagged tracks and applies the plan's reroutes so the living twin
-    reflects the decision — trains follow their new routes on subsequent ticks.
+    Uses the plans from the last pipeline run shown to the console, so the
+    operator executes exactly what they approved even though the twin has
+    ticked since; recomputes only when no recent run exists. Closes flagged
+    tracks and applies the plan's reroutes so the living twin reflects the
+    decision — trains follow their new routes on subsequent ticks.
     Defaults to the Master Agent's recommended plan.
     """
-    snapshot, source = fetch_snapshot()
-    final = pipeline.invoke(_initial_state(snapshot))
+    if _last_run["final"] is not None and time.time() - _last_run["ts"] < _LAST_RUN_TTL:
+        source = _last_run["twin_source"]
+        # Own log copy: repeated applies must not pile Executor entries into
+        # the cached run.
+        final = dict(_last_run["final"])
+        final["log"] = list(final["log"])
+    else:
+        snapshot, source = fetch_snapshot()
+        final = pipeline.invoke(_initial_state(snapshot))
 
     target_id = (plan_id or final["best_plan"]["plan_id"]).upper()
     plan = next((p for p in final["plans"] if p["plan_id"] == target_id), None)
@@ -1178,6 +1271,7 @@ def apply_plan(plan_id: str | None = None):
         raise HTTPException(status_code=404, detail=f"Plan '{target_id}' not found.")
 
     applied = []
+    apply_error = None
     try:
         for action in plan["actions"]:
             if not isinstance(action, dict):
@@ -1189,13 +1283,31 @@ def apply_plan(plan_id: str | None = None):
             elif sid.startswith("R_REROUTE_"):
                 _twin_reroute_train(action["train_id"], action["new_route"])
                 applied.append(f"Rerouted {action['train_id']}")
+            elif sid.startswith("W"):
+                # Weather protocols advertise closures inside action strings
+                # like "close_track_T05+reroute_all_trains" — execute them.
+                for act in action.get("actions", []):
+                    if act.startswith("close_track_"):
+                        track_id = act.removeprefix("close_track_").split("+")[0]
+                        _twin_close_track(track_id)
+                        applied.append(f"Closed track {track_id} (weather protocol {sid})")
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Twin unreachable while applying plan: {e}")
+        # Actions already applied changed the twin — a 502 here would hide
+        # them, so report the partial execution instead.
+        apply_error = e
 
+    if apply_error is None:
+        message = f"Plan {target_id} executed on the live twin: {len(applied)} action(s)"
+    else:
+        message = (f"Plan {target_id} partially executed: {len(applied)} action(s) "
+                   f"applied before the twin became unreachable: {apply_error}")
     final["log"].append({
         "t": time.strftime("%H:%M:%S"),
         "source": "Executor",
-        "message": f"Plan {target_id} executed on the live twin: {len(applied)} action(s)",
+        "message": message,
     })
+    # Template-only explanation: the apply path must answer fast — actions are
+    # already applied to the twin, so a slow LLM call would make the console
+    # time out and mislabel a successful execution as offline.
     return {"executed_plan": target_id, "applied_actions": applied,
-            **_format_response(final, source)}
+            **_format_response(final, source, use_llm=False)}

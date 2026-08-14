@@ -1,4 +1,7 @@
+import time
+
 import pytest
+import requests
 
 import all_agent
 
@@ -118,6 +121,45 @@ def test_execution_log_has_structured_entries():
     assert resp["execution_log"][0]["source"] == "Master"
 
 
+def test_twin_reset_clears_embedded_even_with_remote_base(monkeypatch):
+    # Injections made while the remote was unreachable must not resurface
+    # after a later fallback flip: reset must always clear the embedded twin.
+    all_agent._reset_embedded_twin()
+    all_agent._twin_base_cache["base"] = None
+    all_agent._twin_base_cache["checked_at"] = float("inf")  # force embedded
+    try:
+        all_agent._twin_close_track("T23")
+        assert all_agent._embedded_snapshot()["tracks"]["T23"]["status"] == "CLOSED"
+    finally:
+        all_agent._twin_base_cache["checked_at"] = 0.0
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(all_agent, "_twin_base", lambda: "http://fake-twin")
+    monkeypatch.setattr(all_agent.requests, "post", lambda *a, **k: _FakeResp())
+    all_agent._twin_reset()
+    assert all_agent._embedded_snapshot()["tracks"]["T23"]["status"] != "CLOSED"
+
+
+def test_format_response_use_llm_false_skips_llm(monkeypatch):
+    calls = []
+
+    def fake_llm(final):
+        calls.append(1)
+        return "LLM TEXT"
+
+    monkeypatch.setattr(all_agent, "_llm_explanation", fake_llm)
+    final = run_pipeline(fresh_snapshot())
+    resp = all_agent._format_response(final, "embedded", use_llm=False)
+    assert resp["explanation"]["source"] == "rules"
+    assert not calls
+    resp2 = all_agent._format_response(final, "embedded")
+    assert resp2["explanation"] == {"text": "LLM TEXT", "source": "claude"}
+    assert calls
+
+
 def test_embedded_twin_mutations_persist_across_snapshots():
     all_agent._reset_embedded_twin()
     all_agent._twin_base_cache["base"] = None
@@ -132,3 +174,158 @@ def test_embedded_twin_mutations_persist_across_snapshots():
     finally:
         all_agent._twin_base_cache["checked_at"] = 0.0
         all_agent._reset_embedded_twin()
+
+
+@pytest.fixture
+def embedded_only():
+    """Force the embedded twin and a clean last-run cache, restoring after."""
+    all_agent._reset_embedded_twin()
+    all_agent._twin_base_cache.update({"base": None, "snapshot": None, "checked_at": float("inf")})
+    all_agent._last_run.update({"final": None, "twin_source": None, "ts": 0.0})
+    yield
+    all_agent._twin_base_cache.update({"base": None, "snapshot": None, "checked_at": 0.0})
+    all_agent._last_run.update({"final": None, "twin_source": None, "ts": 0.0})
+    all_agent._reset_embedded_twin()
+
+
+def test_state_probe_body_is_reused_not_refetched(monkeypatch):
+    all_agent._twin_base_cache.update({"base": None, "snapshot": None, "checked_at": 0.0})
+    probe_body = {"trains": {}, "tracks": {}, "weather": {}}
+    calls = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return probe_body
+
+    def fake_get(url, timeout):
+        calls.append(url)
+        if "127.0.0.1:8000" in url:
+            return _Resp()
+        raise requests.RequestException("dead")
+
+    monkeypatch.setattr(all_agent.requests, "get", fake_get)
+    try:
+        snapshot, source = all_agent.fetch_snapshot()
+        assert source == "http://127.0.0.1:8000"
+        assert snapshot == probe_body
+        assert calls.count(f"{source}/api/state/") == 1  # probe body reused — no second GET
+        all_agent.fetch_snapshot()  # cached-base path: exactly one fresh GET
+        assert calls.count(f"{source}/api/state/") == 2
+    finally:
+        all_agent._twin_base_cache.update({"base": None, "snapshot": None, "checked_at": 0.0})
+
+
+def test_apply_plan_executes_the_approved_cached_plan(embedded_only, monkeypatch):
+    snapshot = all_agent._embedded_snapshot()
+    snapshot["tracks"]["T23"]["health"] = 0.0
+    snapshot["tracks"]["T23"]["status"] = "CLOSED"
+    final = run_pipeline(snapshot)
+    all_agent._record_run(final, "embedded")
+    best_id = final["best_plan"]["plan_id"]
+    approved = next(p for p in final["plans"] if p["plan_id"] == best_id)
+    expected_reroutes = [
+        f"Rerouted {a['train_id']}" for a in approved["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("R_REROUTE_")
+    ]
+    assert expected_reroutes  # scenario must actually produce reroutes
+
+    # The twin diverged since approval — a recompute would see no failure and
+    # execute a different plan under the same letter.
+    all_agent._reset_embedded_twin()
+
+    def _no_refetch():
+        raise AssertionError("cached apply must not re-run the pipeline")
+
+    monkeypatch.setattr(all_agent, "fetch_snapshot", _no_refetch)
+    resp = all_agent.apply_plan()
+    assert resp["executed_plan"] == best_id
+    for entry in expected_reroutes:
+        assert entry in resp["applied_actions"]
+
+
+def test_apply_plan_recomputes_when_cache_is_stale(embedded_only, monkeypatch):
+    final = run_pipeline(all_agent._embedded_snapshot())
+    all_agent._record_run(final, "embedded")
+    all_agent._last_run["ts"] = time.time() - 601  # outside the 10-minute window
+    calls = []
+    real_fetch = all_agent.fetch_snapshot
+    monkeypatch.setattr(all_agent, "fetch_snapshot", lambda: calls.append(1) or real_fetch())
+    resp = all_agent.apply_plan()
+    assert calls  # stale cache → fresh pipeline run
+    assert resp["executed_plan"] in {"A", "B", "C"}
+
+
+def test_apply_plan_partial_failure_reports_applied_actions(embedded_only, monkeypatch):
+    snapshot = all_agent._embedded_snapshot()
+    snapshot["tracks"]["T23"]["health"] = 0.0
+    snapshot["tracks"]["T23"]["status"] = "CLOSED"
+    final = run_pipeline(snapshot)
+    all_agent._record_run(final, "embedded")
+    plan_a = next(p for p in final["plans"] if p["plan_id"] == "A")
+    assert any(
+        a.get("strategy_id", "").startswith("R_REROUTE_")
+        for a in plan_a["actions"] if isinstance(a, dict)
+    )
+
+    def _down(train_id, route):
+        raise requests.RequestException("twin went away")
+
+    monkeypatch.setattr(all_agent, "_twin_reroute_train", _down)
+    # Plan A closes tracks before rerouting, so the failure hits mid-loop
+    resp = all_agent.apply_plan(plan_id="A")
+    assert "Closed track T23" in resp["applied_actions"]
+    assert not any(a.startswith("Rerouted") for a in resp["applied_actions"])
+    assert any("partially executed" in e["message"] for e in resp["execution_log"])
+
+
+def test_weather_protocol_changes_simulation_outcome():
+    snapshot = fresh_snapshot()
+    snapshot["weather"] = {"T05": "STORM"}
+    final = run_pipeline(snapshot)
+    w1 = next(s for s in final["weather_strategies"] if s["strategy_id"] == "W1")
+    with_w1 = all_agent._simulate_plan(
+        {"plan_id": "X", "plan_name": "with W1", "actions": [w1]}, snapshot)
+    without_w1 = all_agent._simulate_plan(
+        {"plan_id": "Y", "plan_name": "without W1", "actions": []}, snapshot)
+    assert with_w1["delay"] > without_w1["delay"]
+    assert with_w1["risk"] < without_w1["risk"]
+
+
+def test_apply_plan_executes_weather_protocol_closure(embedded_only):
+    snapshot = all_agent._embedded_snapshot()
+    track_id = sorted(snapshot["tracks"])[0]
+    all_agent._twin_set_weather(track_id, "STORM")
+    final = run_pipeline(all_agent._embedded_snapshot())
+    assert final["weather_strategies"][0]["strategy_id"] == "W1"
+    all_agent._record_run(final, "embedded")
+
+    resp = all_agent.apply_plan()
+    assert any(f"Closed track {track_id}" in a for a in resp["applied_actions"])
+    assert all_agent._embedded_snapshot()["tracks"][track_id]["status"] == "CLOSED"
+
+
+def test_run_stream_rejects_unknown_weather_condition():
+    from fastapi.testclient import TestClient
+
+    client = TestClient(all_agent.app)
+    resp = client.get("/run-stream", params={"weather_track": "T23", "condition": "SNOW"})
+    assert resp.status_code == 400
+    assert "SNOW" in resp.json()["detail"]
+
+
+def test_run_stream_emits_error_event_on_pipeline_crash(embedded_only, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    class _BoomPipeline:
+        def stream(self, state):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(all_agent, "pipeline", _BoomPipeline())
+    client = TestClient(all_agent.app)
+    resp = client.get("/run-stream")
+    assert resp.status_code == 200
+    assert "event: error" in resp.text
+    assert "pipeline failed: boom" in resp.text
