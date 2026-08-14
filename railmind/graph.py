@@ -30,9 +30,15 @@ class RailwayGraph:
             return []
             
         def weight_func(u, v, d):
-            if d.get("status") in (TrackStatus.CLOSED, TrackStatus.DEGRADED):
-                return float("inf")
-            return d.get("length_km", 0.0) / d.get("max_speed_kmh", 1.0)
+            # Returning None hides the edge from NetworkX entirely; a float
+            # (even inf) is treated as an ordinary traversable weight.
+            if d.get("status") == TrackStatus.CLOSED:
+                return None
+            base = d.get("length_km", 0.0) / d.get("max_speed_kmh", 1.0)
+            if d.get("status") == TrackStatus.DEGRADED:
+                # Traversable, but only as a last resort
+                return base * 5.0
+            return base
             
         try:
             return nx.shortest_path(self.graph, source=source, target=destination, weight=weight_func)

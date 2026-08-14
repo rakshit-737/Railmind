@@ -1,8 +1,11 @@
+import random
+
 import pytest
 
 from railmind.data_loader import load_bundled_network
 from railmind.graph import build_network_from_data
 from railmind.models import TrackStatus
+from railmind.simulator import FutureTimelineSimulator
 from railmind.twin import DigitalTwin
 
 
@@ -13,6 +16,22 @@ def twin():
     t = DigitalTwin(graph)
     t.seed_trains(5)
     return t
+
+
+def _two_station_twin(health=0.9):
+    stations = [
+        {"station_id": "A", "name": "Alpha", "lat": 0.0, "lon": 0.0},
+        {"station_id": "B", "name": "Beta", "lat": 1.0, "lon": 1.0},
+    ]
+    tracks = [{
+        "track_id": "TX",
+        "source": "A",
+        "destination": "B",
+        "health": health,
+        "length_km": 100.0,
+        "max_speed_kmh": 100.0,
+    }]
+    return DigitalTwin(build_network_from_data(stations, tracks))
 
 
 def test_seed_trains_deterministic(twin):
@@ -107,3 +126,126 @@ def test_maybe_tick_respects_interval(twin):
     assert twin.maybe_tick(min_interval_s=9999) is False
     twin._last_tick = 0.0
     assert twin.maybe_tick(min_interval_s=1) is True
+
+
+def test_injected_weather_survives_ambient_decay(twin):
+    twin.set_weather("T05", "STORM")
+    for _ in range(50):
+        twin.tick()
+    assert twin.state.weather["T05"].value == "STORM"
+
+
+def test_find_route_raises_when_only_link_closed():
+    t = _two_station_twin()
+    assert t.find_route("A", "B") == ["A", "B"]
+    t.close_track("TX")
+    with pytest.raises(ValueError):
+        t.find_route("A", "B")
+
+
+def test_find_route_traverses_degraded_as_last_resort():
+    # health < 0.4 marks the track DEGRADED at build time
+    t = _two_station_twin(health=0.2)
+    assert t.state.tracks["TX"].status == TrackStatus.DEGRADED
+    assert t.find_route("A", "B") == ["A", "B"]
+
+
+def test_seed_trains_leaves_global_random_untouched():
+    stations, tracks = load_bundled_network()
+    random.seed(123)
+    expected = [random.random() for _ in range(5)]
+    random.seed(123)
+    t = DigitalTwin(build_network_from_data(stations, tracks))
+    t.seed_trains(5)
+    got = [random.random() for _ in range(5)]
+    assert got == expected
+
+
+def test_apply_reroute_action_string(twin):
+    tid = next(iter(twin.state.trains.keys()))
+    twin.apply_action(f"reroute_{tid}_via_NEW_DELHI_JAIPUR_JUNCT_BHOPAL_JUNCT")
+    train = twin.state.trains[tid]
+    assert train.route == ["NEW_DELHI", "JAIPUR_JUNCT", "BHOPAL_JUNCT"]
+    assert train.current_station == "NEW_DELHI"
+    assert train.route_index == 0 and train.progress == 0.0
+
+
+def test_apply_reroute_action_rejects_malformed(twin):
+    tid = next(iter(twin.state.trains.keys()))
+    with pytest.raises(ValueError):
+        twin.apply_action("reroute_via_route_A")  # legacy form: no train id
+    with pytest.raises(ValueError):
+        twin.apply_action(f"reroute_{tid}_via_NEW_DELHI")  # single station
+    with pytest.raises(ValueError):
+        twin.apply_action(f"reroute_{tid}_via_NOPE_NOWHERE")  # unknown stations
+    with pytest.raises(ValueError):
+        twin.apply_action("reroute_GHOST_via_NEW_DELHI_JAIPUR_JUNCT")  # unknown train
+
+
+def test_simulator_differentiates_closure_from_do_nothing(twin):
+    # Close the track directly ahead of a train: the forecast must hold it
+    # and accumulate delay, so the score diverges from inaction.
+    train = next(iter(twin.state.trains.values()))
+    nxt = train.route[train.route_index + 1]
+    track = twin._track_between(train.current_station, nxt)
+    sim = FutureTimelineSimulator(twin)
+
+    do_nothing = sim.generate_scenario("A", [])
+    closure = sim.generate_scenario("B", [f"close_track_{track.track_id}"])
+    assert closure.delay_score > do_nothing.delay_score
+    assert closure.total_score != do_nothing.total_score
+
+    # Forecasts are deterministic: repeated runs agree exactly
+    again = sim.generate_scenario("B", [f"close_track_{track.track_id}"])
+    assert again.total_score == closure.total_score
+
+
+def test_do_nothing_loses_when_acting_is_clearly_better(twin):
+    # Strand a train on the live twin, then compare inaction with rerouting
+    # it around the closure: acting must win.
+    tid, train = next(iter(twin.state.trains.items()))
+    nxt = train.route[train.route_index + 1]
+    track = twin._track_between(train.current_station, nxt)
+    twin.close_track(track.track_id)
+
+    detour = twin.find_route(train.current_station, train.route[-1])
+    reroute_action = f"reroute_{tid}_via_" + "_".join(detour)
+
+    sim = FutureTimelineSimulator(twin)
+    result = sim.run([
+        {"scenario_id": "do_nothing", "actions": []},
+        {"scenario_id": "act", "actions": [reroute_action]},
+    ])
+    assert result.best_scenario == "act"
+    assert result.recommended_actions == [reroute_action]
+
+
+def test_simulator_empty_scenarios_raises(twin):
+    sim = FutureTimelineSimulator(twin)
+    with pytest.raises(ValueError):
+        sim.run([])
+
+
+def test_unpinned_weather_decays(twin):
+    twin.set_weather("T05", "STORM", pin=False)
+    assert "T05" not in twin._pinned_weather
+    cleared = False
+    for _ in range(200):
+        twin.tick()
+        if "T05" not in twin.state.weather:
+            cleared = True
+            break
+    assert cleared
+
+
+def test_clearing_weather_unpins_track(twin):
+    twin.set_weather("T05", "STORM")
+    assert "T05" in twin._pinned_weather
+    twin.set_weather("T05", "CLEAR")
+    assert "T05" not in twin._pinned_weather
+    # Once unpinned, ambient decay may clear any future condition again
+    twin.state.weather = {}
+    for _ in range(50):
+        twin.tick()
+    # No assertion on presence — just ensure ticking never resurrects the pin
+    assert "T05" not in twin._pinned_weather
