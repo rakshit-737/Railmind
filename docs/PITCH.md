@@ -13,7 +13,7 @@ Railway incident response is manual, slow, and local. When a track fails, a huma
 
 1. **A living digital twin** of a 21-station Indian railway network runs continuously — trains move along real corridors, congestion drifts, weather rolls in and clears. Closed tracks physically hold trains.
 2. When something breaks (or a dispatcher injects a scenario), a **LangGraph pipeline of specialist agents** — Weather, Track, Signal, Routing — each analyze the snapshot and emit strategies, streamed live to the console as they think.
-3. A **Planner** composes three response doctrines (Safety First / Balanced / Minimal Intervention); a **simulation engine** plays each one out on a cloned twin, including stranded-train penalties for plans that ignore the failure.
+3. A **Planner** composes three response doctrines (Safety First / Balanced / Minimal Intervention); a **simulation engine** plays each one against the incident snapshot with a twin-informed cost model, including stranded-train penalties for plans that ignore the failure.
 4. The **Master Agent** ranks plans with min-max normalized MCDM scoring (risk 0.40 / delay 0.35 / passengers 0.15 / congestion 0.10) and explains its choice in plain language — via Claude when an API key is present, via a rule engine otherwise.
 5. **One click executes the plan on the live twin** — tracks close, trains take their alternate corridors, and the next pipeline run confirms the network is stable. The loop is closed.
 
@@ -55,5 +55,5 @@ docker compose up          # everything, one command
 
 - 21 stations, 33 corridors, real geography
 - 7 pipeline stages, 4 specialist agents
-- 21 pytest tests + typecheck/lint/build CI
+- 52 pytest tests + 5 console tests + typecheck/lint/build CI
 - 3 deploy paths: docker compose, Render blueprint, bare `npm run dev` + `uvicorn`

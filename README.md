@@ -123,7 +123,7 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
    - *Signal* — combined health + weather risk → RED / YELLOW / GREEN (IRGSR-style rule table)
    - *Routing* — Dijkstra reroutes for every train crossing a failed section
 2. **Planner** composes three doctrines: **A — Safety First**, **B — Balanced Response**, **C — Minimal Intervention**.
-3. **Simulation engine** applies each plan to a cloned twin and measures delay, residual risk, passenger impact and congestion — including stranded-train penalties for plans that ignore failures.
+3. **Simulation engine** plays each plan against the incident snapshot with a twin-informed cost model — delay, residual risk, passenger impact and congestion, including stranded-train penalties for plans that ignore failures. (The core engine's `railmind/simulator.py` additionally forecasts scenarios by cloning the twin and ticking it forward — that clone-and-advance path backs the CLI demo.)
 4. **Master Agent** min-max normalises the four criteria and ranks plans with MCDM weights (risk 0.40, delay 0.35, passengers 0.15, congestion 0.10) → one recommended action with a 0–100 suitability score.
 
 ---
@@ -161,14 +161,19 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 | `ANTHROPIC_API_KEY` | agents | unset | Claude-written plan explanations (rule-engine fallback otherwise) |
 | `VITE_API_BASE_URL` | console | `http://127.0.0.1:8001` | Agent service URL |
 | `RAILMIND_LIVE_OSM` | core | off | Load the real network from OpenStreetMap (Overpass) instead of the bundled dataset; results are cached, failures fall back offline |
+| `DJANGO_SECRET_KEY` · `DJANGO_DEBUG` · `DJANGO_ALLOWED_HOSTS` | twin | dev-friendly defaults | Production hardening — `render.yaml` sets all three on deploy; local dev needs none |
 
 ---
 
 ## Tests
 
 ```bash
-pip install pytest
-python -m pytest tests/ -q
+# Backend (fresh clone: install both service requirements first)
+pip install -r railmind_django/requirements.txt -r agents/requirements.txt pytest
+python -m pytest -q            # on Windows: PYTHONUTF8=1 python -m pytest -q
+
+# Console
+cd railmind-projec && npm install && npm test
 ```
 
-CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.
+The suite is hermetic — an exported `ANTHROPIC_API_KEY` is stripped so tests never call the real API. CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/test/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.
