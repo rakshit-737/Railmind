@@ -129,13 +129,22 @@ export function Dashboard() {
   // Latest-wins guard: an in-flight interval poll must not overwrite a
   // fresher post-run/post-apply snapshot with stale state.
   const liveSeqRef = useRef({ issued: 0, applied: 0 });
+  // Hysteresis: a single dropped /state poll (timeout or blip) must not flap
+  // the console to the mock fleet — flip live→mock only after 2 consecutive
+  // failures; flip back on the first success.
+  const liveFailStreakRef = useRef(0);
 
   const refreshLive = useCallback(async () => {
     const seq = ++liveSeqRef.current.issued;
     const state = await fetchLiveState();
     if (seq <= liveSeqRef.current.applied) return state;
     liveSeqRef.current.applied = seq;
-    setLive(state);
+    if (state) {
+      liveFailStreakRef.current = 0;
+      setLive(state);
+    } else if (++liveFailStreakRef.current >= 2) {
+      setLive(null);
+    }
     return state;
   }, []);
 
@@ -176,6 +185,7 @@ export function Dashboard() {
     const id = setInterval(() => void poll(), 3000);
     return () => {
       stopped = true;
+      liveFailStreakRef.current = 0;
       clearInterval(id);
     };
   }, [refreshLive]);
@@ -206,9 +216,14 @@ export function Dashboard() {
           params,
         );
         // If the stream delivered anything, the backend already applied the
-        // injection — a retry must use plain /run, never re-inject.
+        // injection — a retry must use plain /run, never re-inject. Hand the
+        // injected track to the mock fallback so an offline retry still
+        // reports the right incident.
         const result =
-          streamed.result ?? (streamed.sawEvents ? await runSimulation() : await fallback());
+          streamed.result ??
+          (streamed.sawEvents
+            ? await runSimulation(params.injectTrack ?? params.weatherTrack)
+            : await fallback());
         setData(result);
         recordRun(result);
         await refreshLive();
@@ -267,12 +282,42 @@ export function Dashboard() {
   }
 
   async function doReset() {
-    await resetTwin();
-    setData(null);
-    setLiveLog([]);
-    setSelectedPlan(null);
-    setSelectedTrain(null);
-    await refreshLive();
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setLoading(true);
+    try {
+      const ok = await resetTwin();
+      if (ok) {
+        setData(null);
+        setLiveLog([]);
+        setSelectedPlan(null);
+        setSelectedTrain(null);
+        await refreshLive();
+      } else if (!live) {
+        // Fully offline: the incident only exists in the mock, so there is no
+        // twin to desync from — clear locally, mirroring the offline apply.
+        setData(null);
+        setLiveLog([]);
+        setSelectedPlan(null);
+        setSelectedTrain(null);
+      } else {
+        // Reset never reached the twin — wiping the console here would desync
+        // it from the twin's real state, so keep everything and say so.
+        const notice = {
+          t: new Date().toTimeString().slice(0, 8),
+          source: "System",
+          message: "Reset failed — twin unreachable (state preserved)",
+        };
+        if (data) {
+          setData({ ...data, execution_log: [notice, ...data.execution_log] });
+        } else {
+          setLiveLog((prev) => [notice, ...prev]);
+        }
+      }
+    } finally {
+      setLoading(false);
+      busyRef.current = false;
+    }
   }
 
   // Demo shortcuts: /?autorun runs the pipeline, /?inject=T23 injects a failure.
@@ -320,7 +365,9 @@ export function Dashboard() {
     : (data?.rerouted_trains ?? []);
   const heldTrains = trains.filter((t) => t.held).map((t) => t.id);
 
-  const timeline = loading && liveLog.length > 0 ? liveLog : (data?.execution_log ?? liveLog);
+  // While loading, only ever show the current stream — never the previous
+  // run's log under the STREAMING badge.
+  const timeline = loading ? liveLog : (data?.execution_log ?? liveLog);
 
   return (
     <div className="min-h-screen text-foreground">
@@ -787,7 +834,7 @@ export function Dashboard() {
           <ScrollArea className="h-[260px]">
             <div className="px-4 py-2">
               {timeline.length === 0 ? (
-                <EmptyHint text="No events yet." />
+                <EmptyHint text={loading ? "Connecting to agent stream…" : "No events yet."} />
               ) : (
                 <ol className="relative border-l border-border ml-2">
                   {timeline.map((e, i) => (

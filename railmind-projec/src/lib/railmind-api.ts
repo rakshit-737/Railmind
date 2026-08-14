@@ -82,7 +82,7 @@ function nowHMS(offset = 0) {
 
 // ── Mock pipeline (mirrors the FastAPI agent flow on the same network) ──────
 
-function buildMockRun(trackId?: string): RunResponse {
+export function buildMockRun(trackId?: string): RunResponse {
   const failed = trackId ?? "T23";
   const t = trackById(failed);
   const fromName = stationName(t?.from ?? "NAGPUR_JUNCT");
@@ -242,26 +242,54 @@ function isValidRunResponse(x: unknown): x is RunResponse {
   );
 }
 
-function normalize(r: RunResponse): RunResponse {
+// The render path dereferences plan fields (risk.toFixed, actions.map) — a
+// backend response missing any of them must not crash the dashboard.
+function normalizePlan(p: Plan): Plan {
+  return {
+    ...p,
+    delay_min: p.delay_min ?? 0,
+    risk: p.risk ?? 0,
+    passengers_impacted: p.passengers_impacted ?? 0,
+    congestion: p.congestion ?? 0,
+    score: p.score ?? 0,
+    actions: p.actions ?? [],
+  };
+}
+
+export function normalize(r: RunResponse): RunResponse {
   return {
     ...r,
+    recommended_action: normalizePlan(r.recommended_action),
+    candidate_plans: (r.candidate_plans ?? []).map(normalizePlan),
+    execution_log: r.execution_log ?? [],
     failed_tracks: r.failed_tracks ?? [],
     rerouted_trains: r.rerouted_trains ?? [],
     held_trains: r.held_trains ?? [],
     trains: r.trains && r.trains.length > 0 ? r.trains : TRAINS,
     agent_outputs: {
-      weather: r.agent_outputs?.weather ?? { strategy: "—", risk_score: 0, high_risk_tracks: [] },
-      track: r.agent_outputs?.track ?? { actions: [] },
-      signal: r.agent_outputs?.signal ?? { actions: [] },
-      routing: r.agent_outputs?.routing ?? { affected_trains: [], reroutes: [] },
+      weather: {
+        strategy: r.agent_outputs?.weather?.strategy ?? "—",
+        risk_score: r.agent_outputs?.weather?.risk_score ?? 0,
+        high_risk_tracks: r.agent_outputs?.weather?.high_risk_tracks ?? [],
+      },
+      track: { actions: r.agent_outputs?.track?.actions ?? [] },
+      signal: { actions: r.agent_outputs?.signal?.actions ?? [] },
+      routing: {
+        affected_trains: r.agent_outputs?.routing?.affected_trains ?? [],
+        reroutes: r.agent_outputs?.routing?.reroutes ?? [],
+      },
     },
   };
 }
 
-async function tryFetch(url: string, init?: RequestInit): Promise<RunResponse | null> {
+async function tryFetch(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = 8000,
+): Promise<RunResponse | null> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(url, { ...init, signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return null;
@@ -272,18 +300,23 @@ async function tryFetch(url: string, init?: RequestInit): Promise<RunResponse | 
   }
 }
 
-export async function runSimulation(): Promise<RunResponse> {
-  const real = await tryFetch(`${API_BASE_URL}/run`, { method: "POST" });
+/**
+ * Run the pipeline. `mockTrackId` only shapes the offline mock: pass the track
+ * of an injection that already reached the backend so a fallback after a
+ * mid-stream failure reports the right incident instead of the T23 default.
+ */
+export async function runSimulation(mockTrackId?: string): Promise<RunResponse> {
+  const real = await tryFetch(`${API_BASE_URL}/run`, { method: "POST" }, 20000);
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
-  return buildMockRun();
+  return buildMockRun(mockTrackId);
 }
 
 /** Live twin snapshot for the polling loop. Null when the backend is offline. */
 export async function fetchLiveState(): Promise<LiveState | null> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
+    const timer = setTimeout(() => controller.abort(), 5000);
     const res = await fetch(`${API_BASE_URL}/state`, { signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return null;
@@ -298,12 +331,20 @@ export async function applyPlan(planId?: string): Promise<RunResponse | null> {
   const url = planId
     ? `${API_BASE_URL}/apply-plan?plan_id=${encodeURIComponent(planId)}`
     : `${API_BASE_URL}/apply-plan`;
-  return tryFetch(url, { method: "POST" });
+  // Applying reroutes to a (possibly remote) twin is the slowest call — give
+  // it real headroom so a successful execution is never mislabeled as offline.
+  return tryFetch(url, { method: "POST" }, 25000);
 }
 
 export async function resetTwin(): Promise<boolean> {
   try {
-    const res = await fetch(`${API_BASE_URL}/reset`, { method: "POST" });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(`${API_BASE_URL}/reset`, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
     return res.ok;
   } catch {
     return false;
@@ -390,10 +431,14 @@ export function runSimulationStream(
   });
 }
 
+// Injection endpoints do strictly more work than /run (twin mutation
+// round-trips + full pipeline + LLM budget) — give them the same 20s budget.
 export async function injectTrackFailure(trackId: string): Promise<RunResponse> {
-  const real = await tryFetch(`${API_BASE_URL}/simulate-track-failure/${trackId}`, {
-    method: "POST",
-  });
+  const real = await tryFetch(
+    `${API_BASE_URL}/simulate-track-failure/${trackId}`,
+    { method: "POST" },
+    20000,
+  );
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
   return buildMockRun(trackId);
@@ -403,6 +448,7 @@ export async function injectWeather(trackId: string, condition = "STORM"): Promi
   const real = await tryFetch(
     `${API_BASE_URL}/simulate-weather/${trackId}?condition=${encodeURIComponent(condition)}`,
     { method: "POST" },
+    20000,
   );
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
