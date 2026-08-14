@@ -8,8 +8,17 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r railmind_django/requirements.txt
-    startCommand: cd railmind_django && gunicorn railmind_django.wsgi:application --bind 0.0.0.0:$PORT
+    # --workers 1: twin state is in-process; more workers would each hold their own twin.
+    startCommand: cd railmind_django && gunicorn railmind_django.wsgi:application --bind 0.0.0.0:$PORT --workers 1
     healthCheckPath: /api/state/
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "false"
+      # Leading dot = any *.onrender.com subdomain (covers the Render-assigned hostname).
+      - key: DJANGO_ALLOWED_HOSTS
+        value: .onrender.com
 
   - type: web
     name: railmind-agents

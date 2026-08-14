@@ -20,7 +20,13 @@ from railmind.twin import DigitalTwin
 # first request (never at import time) so the server always boots instantly,
 # even with no network access.
 twin_sessions = {}
+# Guards twin_sessions AND every read-modify/snapshot of a twin: a tick or
+# mutation racing a deepcopy/dump would raise "dictionary changed size during
+# iteration" on the live state dicts.
 _twin_lock = threading.Lock()
+
+# Sandbox sessions kept at most (oldest evicted first); the default twin is never evicted.
+MAX_SANDBOX_SESSIONS = 16
 
 
 def _build_default_twin():
@@ -76,13 +82,14 @@ def get_state(request):
         return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
     # Living twin: state reads advance the simulation (no background thread)
-    twin.maybe_tick()
-    state_dump = twin.get_state()
+    with _twin_lock:
+        twin.maybe_tick()
+        state_dump = twin.get_state()
 
-    graph_state = {
-        "nodes": list(twin.graph.graph.nodes()),
-        "edges": list(twin.graph.graph.edges())
-    }
+        graph_state = {
+            "nodes": list(twin.graph.graph.nodes()),
+            "edges": list(twin.graph.graph.edges())
+        }
 
     return Response({
         "weather": state_dump.get("weather", {}),
@@ -111,7 +118,8 @@ def copy_twin(request):
     """
     Create a new isolated sandbox session (a parallel future) based on the current state.
 
-    Required for simulating multiple futures.
+    Required for simulating multiple futures. At most MAX_SANDBOX_SESSIONS
+    sandbox sessions are kept; creating more evicts the oldest one.
 
     Example usage:
     ```python
@@ -122,15 +130,18 @@ def copy_twin(request):
     if not twin:
         return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
-    new_twin = twin.copy()
     new_session_id = str(uuid.uuid4())
     with _twin_lock:
-        twin_sessions[new_session_id] = new_twin
+        twin_sessions[new_session_id] = twin.copy()
+        sandbox_ids = [sid for sid in twin_sessions if sid != "default"]
+        for sid in sandbox_ids[:max(0, len(sandbox_ids) - MAX_SANDBOX_SESSIONS)]:
+            del twin_sessions[sid]
 
     return Response({
         "status": "success",
         "session_id": new_session_id,
-        "message": "Future state created successfully."
+        "message": "Future state created successfully.",
+        "note": f"At most {MAX_SANDBOX_SESSIONS} sandbox sessions are kept; the oldest is evicted on overflow."
     })
 
 
@@ -154,12 +165,12 @@ def close_track(request):
     if not track_id:
         return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
 
-    if track_id not in twin.state.tracks:
-        return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
-
     try:
-        # Utilizing existing string-based apply_action for closure
-        twin.apply_action(f"close_track_{track_id}")
+        with _twin_lock:
+            if track_id not in twin.state.tracks:
+                return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+            # Utilizing existing string-based apply_action for closure
+            twin.apply_action(f"close_track_{track_id}")
         return Response({"status": "success", "track_id": track_id})
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -187,7 +198,8 @@ def set_weather(request):
         return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        twin.set_weather(track_id, str(condition).upper())
+        with _twin_lock:
+            twin.set_weather(track_id, str(condition).upper())
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -248,11 +260,26 @@ def reroute_train(request):
     if not train_id or not route or not isinstance(route, list):
         return Response({"error": "Missing train_id or invalid route array"}, status=status.HTTP_400_BAD_REQUEST)
 
-    if train_id not in twin.state.trains:
-        return Response({"error": "Train ID not found"}, status=status.HTTP_404_NOT_FOUND)
-
     try:
-        twin.reroute_train(train_id, route)
+        with _twin_lock:
+            if train_id not in twin.state.trains:
+                return Response({"error": "Train ID not found"}, status=status.HTTP_404_NOT_FOUND)
+
+            unknown = [s for s in route if s not in twin.state.stations]
+            if unknown:
+                return Response(
+                    {"error": f"Unknown station id(s): {', '.join(str(s) for s in unknown)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            for u, v in zip(route, route[1:]):
+                if not twin.graph.graph.has_edge(u, v):
+                    return Response(
+                        {"error": f"No track connects '{u}' and '{v}'"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            twin.reroute_train(train_id, route)
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     return Response({"status": "success", "train_id": train_id, "route": route})
@@ -285,7 +312,15 @@ def apply_action(request):
             # Mock fallback for string-based rerouting
             return Response({"status": "acknowledged", "action": action, "note": "Use reroute_train endpoint for concrete routing."})
 
-        twin.apply_action(action)
+        with _twin_lock:
+            if action.startswith("close_track_"):
+                # The twin silently no-ops on unknown ids; reject them here,
+                # consistent with the /api/track/close/ endpoint.
+                track_id = action[len("close_track_"):]
+                if track_id not in twin.state.tracks:
+                    return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+
+            twin.apply_action(action)
         return Response({"status": "success", "action": action})
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
