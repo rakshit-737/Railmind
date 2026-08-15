@@ -36,7 +36,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Keep in step with local dev (npm 11 wrote package-lock.json;
+          # npm 10 refuses it)
+          node-version: 24
           cache: npm
           cache-dependency-path: railmind-projec/package-lock.json
       - name: Install dependencies
