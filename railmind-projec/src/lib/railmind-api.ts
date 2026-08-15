@@ -197,7 +197,11 @@ export function buildMockRun(trackId?: string): RunResponse {
       source: "Planner",
       message: `Planner generated ${plans.length} candidate plans`,
     },
-    { t: nowHMS(-2), source: "Simulator", message: "Simulator evaluated plans on cloned twin" },
+    {
+      t: nowHMS(-2),
+      source: "Simulator",
+      message: "Simulator scored plans against the incident snapshot",
+    },
     {
       t: nowHMS(0),
       source: "Master",
@@ -227,23 +231,59 @@ export function buildMockRun(trackId?: string): RunResponse {
   };
 }
 
+// Mock approximation of a weather incident: storms degrade the track badly
+// enough to close it. Shared by injectWeather's offline path and the
+// storm-run retry in the dashboard so both report a weather-shaped incident.
+export function buildMockWeatherRun(trackId: string, condition = "STORM"): RunResponse {
+  const mock = buildMockRun(trackId);
+  mock.agent_outputs.weather = { strategy: "W1", risk_score: 0.85, high_risk_tracks: [trackId] };
+  mock.execution_log = [
+    {
+      t: nowHMS(0),
+      source: "Weather",
+      message: `${condition} reported on ${trackId} — emergency weather protocol`,
+    },
+    ...mock.execution_log,
+  ];
+  return mock;
+}
+
 // ── Real backend adapter ────────────────────────────────────────────────────
 
-function isValidRunResponse(x: unknown): x is RunResponse {
+function isFiniteNumber(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x);
+}
+
+// Every metric the console renders must be a real number: normalizePlan's 0s
+// exist to survive *optional* gaps, but a plan missing its core metrics would
+// otherwise render "Risk 0.00" — a confident lie on an ops console. Reject it.
+function isValidPlan(x: unknown): x is Plan {
+  if (!x || typeof x !== "object") return false;
+  const p = x as Record<string, unknown>;
+  return (
+    typeof p.id === "string" &&
+    isFiniteNumber(p.delay_min) &&
+    isFiniteNumber(p.risk) &&
+    isFiniteNumber(p.passengers_impacted) &&
+    isFiniteNumber(p.congestion) &&
+    isFiniteNumber(p.score) &&
+    Array.isArray(p.actions)
+  );
+}
+
+export function isValidRunResponse(x: unknown): x is RunResponse {
   if (!x || typeof x !== "object") return false;
   const r = x as Record<string, unknown>;
-  const rec = r.recommended_action as Record<string, unknown> | undefined;
   return (
-    !!rec &&
-    typeof rec.id === "string" &&
-    typeof rec.score === "number" &&
+    isValidPlan(r.recommended_action) &&
     Array.isArray(r.candidate_plans) &&
+    r.candidate_plans.every(isValidPlan) &&
     Array.isArray(r.execution_log)
   );
 }
 
-// The render path dereferences plan fields (risk.toFixed, actions.map) — a
-// backend response missing any of them must not crash the dashboard.
+// Second belt behind isValidRunResponse: defaults the *optional* fields the
+// render path dereferences (preview arrays etc.) so they can never crash it.
 function normalizePlan(p: Plan): Plan {
   return {
     ...p,
@@ -301,15 +341,21 @@ async function tryFetch(
 }
 
 /**
- * Run the pipeline. `mockTrackId` only shapes the offline mock: pass the track
- * of an injection that already reached the backend so a fallback after a
- * mid-stream failure reports the right incident instead of the T23 default.
+ * Run the pipeline. `mockTrackId`/`mockKind` only shape the offline mock: pass
+ * the track (and incident kind) of an injection that already reached the
+ * backend so a fallback after a mid-stream failure reports the right incident
+ * — weather-shaped for storms — instead of the T23 track-failure default.
  */
-export async function runSimulation(mockTrackId?: string): Promise<RunResponse> {
+export async function runSimulation(
+  mockTrackId?: string,
+  mockKind: "track" | "weather" = "track",
+): Promise<RunResponse> {
   const real = await tryFetch(`${API_BASE_URL}/run`, { method: "POST" }, 20000);
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
-  return buildMockRun(mockTrackId);
+  return mockKind === "weather" && mockTrackId
+    ? buildMockWeatherRun(mockTrackId)
+    : buildMockRun(mockTrackId);
 }
 
 /** Live twin snapshot for the polling loop. Null when the backend is offline. */
@@ -452,18 +498,7 @@ export async function injectWeather(trackId: string, condition = "STORM"): Promi
   );
   if (real) return real;
   await new Promise((r) => setTimeout(r, 600));
-  // Mock approximation: storms degrade the track badly enough to close it.
-  const mock = buildMockRun(trackId);
-  mock.agent_outputs.weather = { strategy: "W1", risk_score: 0.85, high_risk_tracks: [trackId] };
-  mock.execution_log = [
-    {
-      t: nowHMS(0),
-      source: "Weather",
-      message: `${condition} reported on ${trackId} — emergency weather protocol`,
-    },
-    ...mock.execution_log,
-  ];
-  return mock;
+  return buildMockWeatherRun(trackId, condition);
 }
 
 export function incidentSummary(r: RunResponse | null) {

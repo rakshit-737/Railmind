@@ -56,6 +56,7 @@ import {
   type LogEvent,
   type Plan,
   type RunResponse,
+  type StreamOutcome,
   type StreamParams,
 } from "@/lib/railmind-api";
 
@@ -115,6 +116,10 @@ type RunRecord = {
 export function Dashboard() {
   const now = useClock();
   const [loading, setLoading] = useState(false);
+  // True only while an SSE run-stream is open — unlike `loading`, which also
+  // covers apply/reset, where the timeline must keep showing the last run's
+  // log instead of an empty "connecting" state under a STREAMING badge.
+  const [streaming, setStreaming] = useState(false);
   const [data, setData] = useState<RunResponse | null>(null);
   const [trackId, setTrackId] = useState<string>("T23");
   const [selectedTrain, setSelectedTrain] = useState<string | null>(null);
@@ -137,10 +142,13 @@ export function Dashboard() {
   const refreshLive = useCallback(async () => {
     const seq = ++liveSeqRef.current.issued;
     const state = await fetchLiveState();
+    // Any success proves the twin is reachable, so it resets the failure
+    // streak even when the snapshot loses the latest-wins race below — the
+    // streak must only ever count *consecutive* genuine failures.
+    if (state) liveFailStreakRef.current = 0;
     if (seq <= liveSeqRef.current.applied) return state;
     liveSeqRef.current.applied = seq;
     if (state) {
-      liveFailStreakRef.current = 0;
       setLive(state);
     } else if (++liveFailStreakRef.current >= 2) {
       setLive(null);
@@ -211,18 +219,25 @@ export function Dashboard() {
       setLiveLog([]);
       setSelectedPlan(null);
       try {
-        const streamed = await runSimulationStream(
-          (e) => setLiveLog((prev) => [e, ...prev]),
-          params,
-        );
+        setStreaming(true);
+        let streamed: StreamOutcome;
+        try {
+          streamed = await runSimulationStream((e) => setLiveLog((prev) => [e, ...prev]), params);
+        } finally {
+          setStreaming(false);
+        }
         // If the stream delivered anything, the backend already applied the
         // injection — a retry must use plain /run, never re-inject. Hand the
-        // injected track to the mock fallback so an offline retry still
-        // reports the right incident.
+        // injected track (and incident kind) to the mock fallback so an
+        // offline retry still reports the right incident, storm-shaped when
+        // the injection was weather.
         const result =
           streamed.result ??
           (streamed.sawEvents
-            ? await runSimulation(params.injectTrack ?? params.weatherTrack)
+            ? await runSimulation(
+                params.injectTrack ?? params.weatherTrack,
+                !params.injectTrack && params.weatherTrack ? "weather" : "track",
+              )
             : await fallback());
         setData(result);
         recordRun(result);
@@ -293,7 +308,13 @@ export function Dashboard() {
         setSelectedPlan(null);
         setSelectedTrain(null);
         await refreshLive();
-      } else if (!live) {
+        return;
+      }
+      // The render-closure `live` can be seconds stale by now (busyRef pauses
+      // polls during the reset call) — re-check liveness before deciding the
+      // twin is gone, so a blipped-but-alive twin never gets its console wiped.
+      const fresh = await refreshLive();
+      if (!fresh) {
         // Fully offline: the incident only exists in the mock, so there is no
         // twin to desync from — clear locally, mirroring the offline apply.
         setData(null);
@@ -365,9 +386,10 @@ export function Dashboard() {
     : (data?.rerouted_trains ?? []);
   const heldTrains = trains.filter((t) => t.held).map((t) => t.id);
 
-  // While loading, only ever show the current stream — never the previous
-  // run's log under the STREAMING badge.
-  const timeline = loading ? liveLog : (data?.execution_log ?? liveLog);
+  // While a stream is open, only ever show the current stream — never the
+  // previous run's log under the STREAMING badge. Outside a stream (idle,
+  // apply, reset) keep showing the last run's log.
+  const timeline = streaming ? liveLog : (data?.execution_log ?? liveLog);
 
   return (
     <div className="min-h-screen text-foreground">
@@ -824,7 +846,7 @@ export function Dashboard() {
               <Activity className="h-4 w-4 text-info" />
               <div className="text-sm font-semibold">Agent Timeline</div>
               <Badge variant="outline" className="ml-2 font-mono-mc text-[10px]">
-                {loading ? "STREAMING" : "EVENT LOG"}
+                {streaming ? "STREAMING" : "EVENT LOG"}
               </Badge>
             </div>
             <div className="text-[11px] text-muted-foreground font-mono-mc">
@@ -834,7 +856,7 @@ export function Dashboard() {
           <ScrollArea className="h-[260px]">
             <div className="px-4 py-2">
               {timeline.length === 0 ? (
-                <EmptyHint text={loading ? "Connecting to agent stream…" : "No events yet."} />
+                <EmptyHint text={streaming ? "Connecting to agent stream…" : "No events yet."} />
               ) : (
                 <ol className="relative border-l border-border ml-2">
                   {timeline.map((e, i) => (

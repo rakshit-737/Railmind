@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildMockRun, normalize, runSimulation, type RunResponse } from "./railmind-api";
+import {
+  buildMockRun,
+  buildMockWeatherRun,
+  isValidRunResponse,
+  normalize,
+  runSimulation,
+  type RunResponse,
+} from "./railmind-api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -18,10 +25,40 @@ describe("buildMockRun", () => {
   });
 });
 
+describe("buildMockWeatherRun", () => {
+  it("shapes the mock as a weather incident, not a bare track failure", () => {
+    const run = buildMockWeatherRun("T11");
+    expect(run.failed_tracks).toContain("T11");
+    expect(run.agent_outputs.weather.strategy).toBe("W1");
+    expect(run.agent_outputs.weather.high_risk_tracks).toContain("T11");
+    expect(run.execution_log[0].source).toBe("Weather");
+    expect(run.execution_log[0].message).toContain("STORM reported on T11");
+  });
+});
+
+describe("isValidRunResponse", () => {
+  it("accepts a complete run", () => {
+    expect(isValidRunResponse(buildMockRun())).toBe(true);
+  });
+
+  it("rejects a response whose plan is missing risk", () => {
+    // normalizePlan would otherwise render the gap as a confident "Risk 0.00".
+    const run = buildMockRun() as unknown as { candidate_plans: Record<string, unknown>[] };
+    delete run.candidate_plans[1].risk;
+    expect(isValidRunResponse(run)).toBe(false);
+  });
+
+  it("rejects a recommendation with a non-finite score", () => {
+    const run = buildMockRun();
+    run.recommended_action.score = NaN;
+    expect(isValidRunResponse(run)).toBe(false);
+  });
+});
+
 describe("normalize", () => {
   it("defaults every nested field the render path dereferences", () => {
-    // A structurally valid response (passes the tryFetch gate) whose optional
-    // interiors are all missing — must come out fully defaulted, not crash.
+    // Second belt behind isValidRunResponse (which now rejects a response this
+    // sparse): even fed directly, it must come out fully defaulted, not crash.
     const sparse = {
       twin_source: "embedded",
       explanation: { text: "x", source: "rules" },
@@ -57,5 +94,13 @@ describe("runSimulation", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
     const run = await runSimulation();
     expect(run.failed_tracks).toContain("T23");
+  });
+
+  it("falls back to a weather-shaped mock when the injection was a storm", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+    const run = await runSimulation("T11", "weather");
+    expect(run.failed_tracks).toContain("T11");
+    expect(run.agent_outputs.weather.strategy).toBe("W1");
+    expect(run.execution_log[0].message).toContain("STORM reported on T11");
   });
 });
