@@ -1,10 +1,20 @@
 # RailMind 🚆🧠
 
+[![CI](https://github.com/rakshit-737/Railmind/actions/workflows/ci.yml/badge.svg)](https://github.com/rakshit-737/Railmind/actions/workflows/ci.yml)
+
 **RailMind** is an autonomous multi-agent railway operating system that monitors, predicts, and optimizes railway operations in real time.
 
-A **digital twin** of a 21-station Indian railway network feeds a **LangGraph pipeline of specialist AI agents** (weather, track, signal, routing) that generate candidate response plans, simulate each one on a cloned twin, and rank them with **MCDM scoring** — all surfaced live on a mission-control **operator console**.
+A **digital twin** of a 21-station Indian railway network feeds a **LangGraph pipeline of specialist AI agents** (weather, track, signal, routing) that generate candidate response plans, play each one against the incident snapshot with a twin-informed cost model, and rank them with **MCDM scoring** — all surfaced live on a mission-control **operator console**.
 
 > **Zero-setup demo:** every layer is offline-first. No API keys, no internet required — the whole stack runs on your laptop.
+
+**Live operations** — trains moving on real geography, ambient weather, per-track health:
+
+![Live operations](docs/screenshot-live.png)
+
+**Incident response** — failure injected: held train flagged, reroutes drawn, three scored plans, explained recommendation, one-click execution:
+
+![Incident response](docs/screenshot-incident.png)
 
 ---
 
@@ -57,7 +67,7 @@ Twin on :8000, agents on :8001, console on http://localhost:8080. Set `ANTHROPIC
 
 ### Option B — local dev (three terminals)
 
-Prerequisites: **Python 3.11+**, **Node 20+**.
+Prerequisites: **Python 3.11+**, **Node 24+** (the lockfile is npm 11 format; CI runs Node 24).
 
 ### 1. Digital twin (Django) — port 8000
 
@@ -122,7 +132,7 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
    - *Track* — health thresholds → close / speed-restrict / monitor
    - *Signal* — combined health + weather risk → RED / YELLOW / GREEN (IRGSR-style rule table)
    - *Routing* — Dijkstra reroutes for every train crossing a failed section
-2. **Planner** composes three doctrines: **A — Safety First**, **B — Balanced Response**, **C — Minimal Intervention**.
+2. **Planner** composes three doctrines: **A — Safety First**, **B — Balanced Response**, **C — Minimal Intervention**. Weather response scales with the doctrine: A carries emergency closures (with reroutes around them), B speed restrictions, C monitoring only — so approving "Minimal Intervention" never executes an emergency closure.
 3. **Simulation engine** plays each plan against the incident snapshot with a twin-informed cost model — delay, residual risk, passenger impact and congestion, including stranded-train penalties for plans that ignore failures. (The core engine's `railmind/simulator.py` additionally forecasts scenarios by cloning the twin and ticking it forward — that clone-and-advance path backs the CLI demo.)
 4. **Master Agent** min-max normalises the four criteria and ranks plans with MCDM weights (risk 0.40, delay 0.35, passengers 0.15, congestion 0.10) → one recommended action with a 0–100 suitability score.
 
