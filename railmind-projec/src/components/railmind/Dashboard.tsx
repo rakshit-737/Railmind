@@ -219,13 +219,16 @@ export function Dashboard() {
       setLiveLog([]);
       setSelectedPlan(null);
       try {
+        // Streaming stays true until this run's RESULT lands, not merely
+        // until the stream closes — a mid-stream crash falls back to a
+        // retry fetch, and during it the timeline must keep showing this
+        // run's streamed events (with any crash notice), not the previous
+        // run's execution log.
         setStreaming(true);
-        let streamed: StreamOutcome;
-        try {
-          streamed = await runSimulationStream((e) => setLiveLog((prev) => [e, ...prev]), params);
-        } finally {
-          setStreaming(false);
-        }
+        const streamed: StreamOutcome = await runSimulationStream(
+          (e) => setLiveLog((prev) => [e, ...prev]),
+          params,
+        );
         // If the stream delivered anything, the backend already applied the
         // injection — a retry must use plain /run, never re-inject. Hand the
         // injected track (and incident kind) to the mock fallback so an
@@ -243,6 +246,7 @@ export function Dashboard() {
         recordRun(result);
         await refreshLive();
       } finally {
+        setStreaming(false);
         setLoading(false);
         busyRef.current = false;
       }
@@ -315,8 +319,13 @@ export function Dashboard() {
       // twin is gone, so a blipped-but-alive twin never gets its console wiped.
       const fresh = await refreshLive();
       if (!fresh) {
-        // Fully offline: the incident only exists in the mock, so there is no
-        // twin to desync from — clear locally, mirroring the offline apply.
+        // Fully offline (reset failed AND the confirming probe failed — two
+        // independent signals, so the hysteresis intent holds): the incident
+        // only exists in the mock — clear locally, mirroring the offline
+        // apply, and flip the map to the mock fleet in the same render so
+        // status, map and data never disagree.
+        setLive(null);
+        liveFailStreakRef.current = 0;
         setData(null);
         setLiveLog([]);
         setSelectedPlan(null);

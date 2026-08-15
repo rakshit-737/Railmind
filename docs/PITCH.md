@@ -55,5 +55,5 @@ docker compose up          # everything, one command
 
 - 21 stations, 33 corridors, real geography
 - 7 pipeline stages, 4 specialist agents
-- 61 pytest tests + 10 console tests + typecheck/lint/test/build CI
+- 64 pytest tests + 10 console tests + typecheck/lint/test/build CI
 - 3 deploy paths: docker compose, Render blueprint, bare `npm run dev` + `uvicorn`

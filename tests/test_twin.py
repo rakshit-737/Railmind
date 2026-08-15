@@ -226,6 +226,40 @@ def test_reroute_parser_resolves_genuine_nested_id():
     assert t.state.trains[tid].route == ["B", "A_B"]
 
 
+def test_reroute_parser_is_polynomial_on_adversarial_strings():
+    # A clique of nested ids gives exponentially many segmentations; an
+    # unreachable tail forces the parser to reject them all. Without
+    # failure memoization this hangs for minutes — HTTP callers feed
+    # arbitrary strings into this parser, so it must stay fast.
+    import itertools
+    import time
+
+    names = ["A", "B", "C", "A_B", "B_C"]
+    stations = [
+        {"station_id": n, "name": n, "lat": float(i), "lon": 0.0}
+        for i, n in enumerate(names)
+    ]
+    stations += [
+        {"station_id": "LONELY", "name": "L", "lat": 9.0, "lon": 9.0},
+        {"station_id": "OUT", "name": "O", "lat": 9.5, "lon": 9.0},
+    ]
+    tracks = []
+    for k, (u, v) in enumerate(itertools.combinations(names, 2)):
+        tracks.append({"track_id": f"T{k}", "source": u, "destination": v,
+                       "health": 0.9, "length_km": 50.0, "max_speed_kmh": 100.0})
+    tracks.append({"track_id": "TL", "source": "LONELY", "destination": "OUT",
+                   "health": 0.9, "length_km": 50.0, "max_speed_kmh": 100.0})
+    t = DigitalTwin(build_network_from_data(stations, tracks))
+    t.seed_trains(1)
+    tid = next(iter(t.state.trains.keys()))
+
+    route = "_".join(["A_B_C"] * 40) + "_LONELY"
+    start = time.perf_counter()
+    with pytest.raises(ValueError):
+        t.apply_action(f"reroute_{tid}_via_{route}")
+    assert time.perf_counter() - start < 2.0
+
+
 def test_close_track_unknown_id_raises(twin):
     with pytest.raises(ValueError):
         twin.close_track("NOPE")

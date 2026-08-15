@@ -337,8 +337,9 @@ def apply_action(request):
                 return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
             if action.startswith("close_track_"):
-                # The twin silently no-ops on unknown ids; reject them here,
-                # consistent with the /api/track/close/ endpoint.
+                # The twin raises ValueError (-> 400) on unknown ids;
+                # pre-check so unknown tracks 404 instead, consistent with
+                # the /api/track/close/ endpoint.
                 track_id = action[len("close_track_"):]
                 if track_id not in twin.state.tracks:
                     return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)

@@ -128,6 +128,14 @@ class DigitalTwin:
         stations = set(self.graph.graph.nodes())
         tokens = route_part.split("_")
 
+        # Failed (position, previous-station, capped-count) states are
+        # memoized: without this, action strings crafted around densely
+        # connected nested ids explore exponentially many segmentations —
+        # a denial of service, since HTTP callers feed arbitrary strings
+        # here. Count is capped at 2 because beyond the >=2-stations rule
+        # it cannot change the outcome.
+        failed = set()
+
         def parse(i, prev, count):
             # Longest match first, backtracking on failure. A candidate is
             # accepted only if it names a station connected by a track to
@@ -137,6 +145,9 @@ class DigitalTwin:
             # is rejected in favour of a connected segmentation.
             if i == len(tokens):
                 return [] if count >= 2 else None
+            key = (i, prev, min(count, 2))
+            if key in failed:
+                return None
             for j in range(len(tokens), i, -1):
                 candidate = "_".join(tokens[i:j])
                 if candidate not in stations:
@@ -146,6 +157,7 @@ class DigitalTwin:
                 rest = parse(j, candidate, count + 1)
                 if rest is not None:
                     return [candidate] + rest
+            failed.add(key)
             return None
 
         route = parse(0, None, 0)
@@ -154,15 +166,20 @@ class DigitalTwin:
 
         # Diagnose the failure: a membership-only segmentation tells unknown
         # stations apart from known ones that just do not connect.
+        names_failed = set()
+
         def parse_names_only(i):
             if i == len(tokens):
                 return []
+            if i in names_failed:
+                return None
             for j in range(len(tokens), i, -1):
                 candidate = "_".join(tokens[i:j])
                 if candidate in stations:
                     rest = parse_names_only(j)
                     if rest is not None:
                         return [candidate] + rest
+            names_failed.add(i)
             return None
 
         names = parse_names_only(0)

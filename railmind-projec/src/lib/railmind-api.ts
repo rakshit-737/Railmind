@@ -243,7 +243,11 @@ export function buildMockWeatherRun(trackId: string, condition = "STORM"): RunRe
       source: "Weather",
       message: `${condition} reported on ${trackId} — emergency weather protocol`,
     },
-    ...mock.execution_log,
+    // The base mock's "Nominal conditions" Weather entry would contradict
+    // the storm story — drop it.
+    ...mock.execution_log.filter(
+      (e) => !(e.source === "Weather" && e.message.includes("Nominal conditions")),
+    ),
   ];
   return mock;
 }

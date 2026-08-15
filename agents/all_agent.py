@@ -479,6 +479,13 @@ def routing_node(state: RailState) -> RailState:
         s["track_id"] for s in state["track_strategies"]
         if s.get("action") == "close_track"
     ]
+    # W1's emergency closures promise "reroute_all_trains" — honor it: treat
+    # high-weather-risk tracks as closed so affected trains get reroutes
+    # instead of being silently stranded by the weather protocol.
+    closed_tracks += [
+        t for t, r in state.get("weather_risk", {}).items()
+        if r > 70 and t not in closed_tracks
+    ]
 
     closed_edges = set()
     for track_id in closed_tracks:
@@ -560,8 +567,11 @@ def planner_node(state: RailState) -> RailState:
     #   A — aggressive: W1 emergency closures + W2 hard speed restrictions
     #   B — restrictions only: W2 (high-risk) / W3 (medium-risk) speed limits
     #   C — monitoring only: W4 reassess / W5 nominal
+    # W3 belongs in A too: medium-risk weather (RAIN/FOG) emits only W3/W4,
+    # and "Safety First" must degrade to the strongest available mitigation
+    # rather than an empty weather set.
     weather_by_plan = {
-        "A": [w for w in weather if w["strategy_id"] in ("W1", "W2")],
+        "A": [w for w in weather if w["strategy_id"] in ("W1", "W2", "W3")],
         "B": [w for w in weather if w["strategy_id"] in ("W2", "W3")],
         "C": [w for w in weather if w["strategy_id"] in ("W4", "W5")],
     }
@@ -632,9 +642,9 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
         if t.get("health", 1.0) <= 0.2 or t.get("status") == "CLOSED"
     }
 
-    def _crosses_failure(route: List[str]) -> bool:
+    def _crosses(route: List[str], edges) -> bool:
         return any(
-            frozenset({route[i], route[i + 1]}) in failed_edges
+            frozenset({route[i], route[i + 1]}) in edges
             for i in range(len(route) - 1)
         )
 
@@ -642,6 +652,9 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
         a.get("train_id") for a in plan["actions"]
         if isinstance(a, dict) and a.get("strategy_id", "").startswith(("R_REROUTE_", "R_HOLD_"))
     }
+
+    # Tracks this plan's own weather protocol closes (filled in the W branch)
+    w_closed_edges: set = set()
 
     for action in plan["actions"]:
         if not isinstance(action, dict):
@@ -693,6 +706,15 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
                     delay += 20
                     risk -= 0.15
                     congestion += 0.10
+                    # A weather closure blocks the track for THIS plan just
+                    # like a health failure would — trains it strands must
+                    # be priced below, not ignored.
+                    tid = act[len("close_track_"):].split("+")[0]
+                    closed = tracks.get(tid)
+                    if closed:
+                        w_closed_edges.add(
+                            frozenset({closed["source"], closed["destination"]})
+                        )
                 elif act.startswith("reduce_speed_40kmh_"):
                     delay += 10
                     risk -= 0.08
@@ -700,17 +722,37 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
                     delay += 5
                     risk -= 0.04
 
-    # Trains left running toward a failed track with no reroute/hold in this
-    # plan are stranded: heavy delay, full passenger impact, elevated risk.
-    if failed_edges:
+    # Trains left running toward a failed (or plan-closed) track with no
+    # reroute/hold in this plan are stranded: heavy delay, full passenger
+    # impact, elevated risk.
+    blocked_edges = failed_edges | w_closed_edges
+    if blocked_edges:
         for train_id, train in trains.items():
             if train_id in handled_trains:
                 continue
-            if _crosses_failure(train.get("route", [])):
+            if _crosses(train.get("route", []), blocked_edges):
                 delay += 60
                 risk += 0.25
                 congestion += 0.15
                 passenger_impact += train.get("passengers", 0)
+
+    # Weather a plan leaves unmitigated is a cost, not a free pass: running
+    # trains through a storm must weigh on the plan that only monitors.
+    w_actions = [
+        act
+        for a in plan["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("W")
+        for act in a.get("actions", [])
+    ]
+    for track_id, condition in snapshot.get("weather", {}).items():
+        cond_risk = WEATHER_CONDITION_RISK.get(str(condition), 0.0)
+        mitigated = any(track_id in act for act in w_actions)
+        if mitigated:
+            continue
+        if cond_risk > 70:
+            risk += 0.20
+        elif cond_risk > 40:
+            risk += 0.08
 
     risk = max(0.0, min(1.0, risk))
     congestion = round(min(congestion, 1.0), 2)

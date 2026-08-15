@@ -321,6 +321,27 @@ def test_storm_weather_strategies_follow_plan_doctrine():
     assert w_ids["C"] <= {"W4", "W5"} and w_ids["C"]  # monitoring only
 
 
+def test_medium_risk_weather_gives_plan_a_real_mitigation():
+    # RAIN/FOG emit only W3/W4 (medium band) — "Safety First" must degrade
+    # to the strongest available mitigation, never an empty weather set.
+    snapshot = fresh_snapshot()
+    snapshot["weather"] = {"T05": "RAIN"}
+    final = run_pipeline(snapshot)
+    by_id = {p["plan_id"]: p for p in final["plans"]}
+    a_ids = {a["strategy_id"] for a in _plan_weather_actions(by_id["A"])}
+    assert "W3" in a_ids
+
+
+def test_unmitigated_storm_costs_the_do_nothing_plan():
+    # Plan C leaves trains running through the storm — its simulated risk
+    # must exceed Plan A's, which closes and reroutes around the track.
+    snapshot = fresh_snapshot()
+    snapshot["weather"] = {"T05": "STORM"}
+    final = run_pipeline(snapshot)
+    by_id = {r["plan_id"]: r for r in final["simulation_results"]}
+    assert by_id["C"]["risk"] > by_id["A"]["risk"]
+
+
 def test_storm_weather_deltas_differentiate_plan_scores():
     # With doctrine-specific W strategies the weather component must genuinely
     # differ across A/B/C — identical contributions would normalise away.
