@@ -553,12 +553,25 @@ def planner_node(state: RailState) -> RailState:
     signal  = state["signal_strategies"]
     routing = state["routing_strategies"]
 
+    # Weather strategies follow each plan's doctrine — bundling all of them
+    # into every plan would let an approved "Minimal Intervention" still close
+    # the stormy track, and identical W deltas across A/B/C would vanish in
+    # min-max normalisation so weather could never re-rank the plans.
+    #   A — aggressive: W1 emergency closures + W2 hard speed restrictions
+    #   B — restrictions only: W2 (high-risk) / W3 (medium-risk) speed limits
+    #   C — monitoring only: W4 reassess / W5 nominal
+    weather_by_plan = {
+        "A": [w for w in weather if w["strategy_id"] in ("W1", "W2")],
+        "B": [w for w in weather if w["strategy_id"] in ("W2", "W3")],
+        "C": [w for w in weather if w["strategy_id"] in ("W4", "W5")],
+    }
+
     plans = [
         {
             "plan_id": "A",
             "plan_name": PLAN_NAMES["A"],
             "actions":
-                weather +
+                weather_by_plan["A"] +
                 [x for x in track if "CLOSE" in x["strategy_id"]] +
                 [x for x in signal if "RED" in x["strategy_id"]] +
                 routing,
@@ -567,7 +580,7 @@ def planner_node(state: RailState) -> RailState:
             "plan_id": "B",
             "plan_name": PLAN_NAMES["B"],
             "actions":
-                weather +
+                weather_by_plan["B"] +
                 [x for x in track if "RESTRICT" in x["strategy_id"] or "MONITOR" in x["strategy_id"]] +
                 [x for x in signal if "YELLOW" in x["strategy_id"]] +
                 routing,
@@ -576,7 +589,7 @@ def planner_node(state: RailState) -> RailState:
             "plan_id": "C",
             "plan_name": PLAN_NAMES["C"],
             "actions":
-                weather +
+                weather_by_plan["C"] +
                 [x for x in track if "MONITOR" in x["strategy_id"] or x["strategy_id"] == "T_OK"] +
                 [x for x in signal if "GREEN" in x["strategy_id"]] +
                 [{"strategy_id": "R_NOMINAL"}],
@@ -1044,6 +1057,15 @@ def _record_run(final: RailState, twin_source: str) -> None:
     _last_run["ts"] = time.time()
 
 
+def _clear_last_run() -> None:
+    """Invalidate cached plans. Must run whenever the world is wholesale
+    replaced (/reset): the cached plans describe a twin that no longer exists,
+    and applying them would silently undo the replacement."""
+    _last_run["final"] = None
+    _last_run["twin_source"] = None
+    _last_run["ts"] = 0.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1097,6 +1119,10 @@ def live_state():
 @app.post("/reset")
 def reset():
     """Reset the twin to its baseline state (clears failures, weather, reroutes)."""
+    # Clear cached plans first — even a partially failed reset has already
+    # replaced the embedded twin, and /apply-plan must never re-close tracks
+    # the reset just reopened.
+    _clear_last_run()
     try:
         _twin_reset()
     except requests.RequestException as e:
@@ -1177,10 +1203,12 @@ def run_pipeline_stream(inject_track: str | None = None, weather_track: str | No
             yield _sse("result", payload)
             yield _sse("done", {})
         except Exception as e:
-            # A mid-stream crash must not end the stream silently — the console
-            # would just see the connection drop with no explanation.
-            yield _sse("error", {"t": time.strftime("%H:%M:%S"), "source": "System",
-                                 "message": f"pipeline failed: {e}"})
+            # A mid-stream crash must not end the stream silently — and the
+            # browser EventSource routes `event: error` to source.onerror,
+            # which carries no payload, so the operator would never see the
+            # message. Emit a normal log event the console timeline renders.
+            yield _sse("log", {"t": time.strftime("%H:%M:%S"), "source": "System",
+                               "message": f"pipeline failed: {e}"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1255,11 +1283,16 @@ def apply_plan(plan_id: str | None = None):
     decision — trains follow their new routes on subsequent ticks.
     Defaults to the Master Agent's recommended plan.
     """
-    if _last_run["final"] is not None and time.time() - _last_run["ts"] < _LAST_RUN_TTL:
-        source = _last_run["twin_source"]
+    # Read the cached run into locals ONCE: a concurrent /reset nulls the
+    # shared dict, so a check-then-reread would crash (or worse, mix runs)
+    # mid-request.
+    cached = _last_run["final"]
+    cached_source = _last_run["twin_source"]
+    if cached is not None and time.time() - _last_run["ts"] < _LAST_RUN_TTL:
+        source = cached_source
         # Own log copy: repeated applies must not pile Executor entries into
         # the cached run.
-        final = dict(_last_run["final"])
+        final = dict(cached)
         final["log"] = list(final["log"])
     else:
         snapshot, source = fetch_snapshot()

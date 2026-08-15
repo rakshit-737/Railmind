@@ -63,3 +63,21 @@ def test_apply_unknown_plan_404s(client):
 
 def test_reset_succeeds(client):
     assert client.post("/reset").status_code == 200
+
+
+def test_reset_invalidates_cached_plans(client):
+    # Inject → plans cached → reset reopens T23. Applying afterwards must run
+    # a fresh pipeline against the reset twin, not replay the cached plan that
+    # would silently re-close T23 and reroute trains around it.
+    ran = client.post("/simulate-track-failure/T23").json()
+    assert "T23" in ran["failed_tracks"]
+    assert client.post("/reset").status_code == 200
+    assert all_agent._last_run["final"] is None
+    assert all_agent._embedded_snapshot()["tracks"]["T23"]["status"] != "CLOSED"
+
+    resp = client.post("/apply-plan")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert not any("T23" in action for action in body["applied_actions"])
+    assert "T23" not in body["failed_tracks"]
+    assert all_agent._embedded_snapshot()["tracks"]["T23"]["status"] != "CLOSED"

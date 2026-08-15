@@ -206,6 +206,9 @@ def test_state_probe_body_is_reused_not_refetched(monkeypatch):
             return _Resp()
         raise requests.RequestException("dead")
 
+    # The hermetic conftest fixture empties TWIN_CANDIDATES; this test needs a
+    # probeable candidate (requests.get is stubbed, so nothing hits the network).
+    monkeypatch.setattr(all_agent, "TWIN_CANDIDATES", ["http://127.0.0.1:8000"])
     monkeypatch.setattr(all_agent.requests, "get", fake_get)
     try:
         snapshot, source = all_agent.fetch_snapshot()
@@ -282,29 +285,89 @@ def test_apply_plan_partial_failure_reports_applied_actions(embedded_only, monke
 
 
 def test_weather_protocol_changes_simulation_outcome():
+    # Exercise the plans the planner actually produces: A carries the W1
+    # closure, C only monitors — the weather deltas must show up in the
+    # simulated outcomes, not just in the strategy labels.
     snapshot = fresh_snapshot()
     snapshot["weather"] = {"T05": "STORM"}
     final = run_pipeline(snapshot)
-    w1 = next(s for s in final["weather_strategies"] if s["strategy_id"] == "W1")
-    with_w1 = all_agent._simulate_plan(
-        {"plan_id": "X", "plan_name": "with W1", "actions": [w1]}, snapshot)
-    without_w1 = all_agent._simulate_plan(
-        {"plan_id": "Y", "plan_name": "without W1", "actions": []}, snapshot)
-    assert with_w1["delay"] > without_w1["delay"]
-    assert with_w1["risk"] < without_w1["risk"]
+    by_id = {r["plan_id"]: r for r in final["simulation_results"]}
+    assert by_id["A"]["delay"] > by_id["C"]["delay"]
+    assert by_id["A"]["risk"] < by_id["C"]["risk"]
 
 
-def test_apply_plan_executes_weather_protocol_closure(embedded_only):
+def _plan_weather_actions(plan):
+    return [
+        a for a in plan["actions"]
+        if isinstance(a, dict) and a.get("strategy_id", "").startswith("W")
+    ]
+
+
+def test_storm_weather_strategies_follow_plan_doctrine():
+    # Bundling every W strategy into every plan let an approved "Minimal
+    # Intervention" close the stormy track and gave all plans identical
+    # weather deltas (erased by min-max normalisation). Each plan must carry
+    # only its doctrine's weather strategies.
+    snapshot = fresh_snapshot()
+    snapshot["weather"] = {"T05": "STORM"}
+    final = run_pipeline(snapshot)
+    assert final["weather_strategies"][0]["strategy_id"] == "W1"  # pipeline list unchanged
+    by_id = {p["plan_id"]: p for p in final["plans"]}
+
+    w_ids = {p: {a["strategy_id"] for a in _plan_weather_actions(by_id[p])} for p in "ABC"}
+    assert "W1" in w_ids["A"]                       # aggressive: emergency closure
+    assert w_ids["A"] <= {"W1", "W2"}
+    assert w_ids["B"] == {"W2"}                     # restrictions only
+    assert w_ids["C"] <= {"W4", "W5"} and w_ids["C"]  # monitoring only
+
+
+def test_storm_weather_deltas_differentiate_plan_scores():
+    # With doctrine-specific W strategies the weather component must genuinely
+    # differ across A/B/C — identical contributions would normalise away.
+    snapshot = fresh_snapshot()
+    snapshot["weather"] = {"T05": "STORM"}
+    final = run_pipeline(snapshot)
+    by_id = {p["plan_id"]: p for p in final["plans"]}
+
+    def w_contribution(plan):
+        sim = all_agent._simulate_plan(
+            {"plan_id": plan["plan_id"], "plan_name": plan["plan_name"],
+             "actions": _plan_weather_actions(plan)},
+            snapshot)
+        return (sim["delay"], sim["risk"])
+
+    contributions = [w_contribution(by_id[p]) for p in "ABC"]
+    assert len(set(contributions)) == 3
+
+
+def _stormy_track_run():
+    """Inject a storm on an open track, run the pipeline, cache the run."""
     snapshot = all_agent._embedded_snapshot()
-    track_id = sorted(snapshot["tracks"])[0]
+    track_id = next(
+        tid for tid in sorted(snapshot["tracks"])
+        if snapshot["tracks"][tid]["status"] != "CLOSED"
+    )
     all_agent._twin_set_weather(track_id, "STORM")
     final = run_pipeline(all_agent._embedded_snapshot())
     assert final["weather_strategies"][0]["strategy_id"] == "W1"
     all_agent._record_run(final, "embedded")
+    return track_id
 
-    resp = all_agent.apply_plan()
+
+def test_apply_plan_a_executes_weather_protocol_closure(embedded_only):
+    track_id = _stormy_track_run()
+    resp = all_agent.apply_plan(plan_id="A")
     assert any(f"Closed track {track_id}" in a for a in resp["applied_actions"])
     assert all_agent._embedded_snapshot()["tracks"][track_id]["status"] == "CLOSED"
+
+
+def test_apply_plan_c_leaves_stormy_track_open(embedded_only):
+    # Minimal Intervention monitors only — approving it must not run the W1
+    # closure that belongs to Safety First.
+    track_id = _stormy_track_run()
+    resp = all_agent.apply_plan(plan_id="C")
+    assert not any(a.startswith("Closed track") for a in resp["applied_actions"])
+    assert all_agent._embedded_snapshot()["tracks"][track_id]["status"] != "CLOSED"
 
 
 def test_run_stream_rejects_unknown_weather_condition():
@@ -316,7 +379,7 @@ def test_run_stream_rejects_unknown_weather_condition():
     assert "SNOW" in resp.json()["detail"]
 
 
-def test_run_stream_emits_error_event_on_pipeline_crash(embedded_only, monkeypatch):
+def test_run_stream_surfaces_pipeline_crash_as_log_event(embedded_only, monkeypatch):
     from fastapi.testclient import TestClient
 
     class _BoomPipeline:
@@ -327,5 +390,9 @@ def test_run_stream_emits_error_event_on_pipeline_crash(embedded_only, monkeypat
     client = TestClient(all_agent.app)
     resp = client.get("/run-stream")
     assert resp.status_code == 200
-    assert "event: error" in resp.text
+    # EventSource dispatches `event: error` to source.onerror without any
+    # payload — the failure must arrive as a log event the timeline renders.
+    assert "event: error" not in resp.text
+    assert "event: log" in resp.text
     assert "pipeline failed: boom" in resp.text
+    assert '"source": "System"' in resp.text
