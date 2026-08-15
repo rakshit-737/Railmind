@@ -753,6 +753,19 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
             risk += 0.20
         elif cond_risk > 40:
             risk += 0.08
+        else:
+            continue
+        # Trains driven through unmitigated bad weather are late and exposed
+        # — without this, the do-nothing plan rides its zero delay to the
+        # top of the MCDM ranking during a storm.
+        track = tracks.get(track_id, {})
+        edge = frozenset({track.get("source"), track.get("destination")})
+        for train_id, train in trains.items():
+            if train_id in handled_trains:
+                continue
+            if _crosses(train.get("route", []), {edge}):
+                delay += 25 if cond_risk > 70 else 10
+                passenger_impact += train.get("passengers", 0)
 
     risk = max(0.0, min(1.0, risk))
     congestion = round(min(congestion, 1.0), 2)
