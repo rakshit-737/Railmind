@@ -1,4 +1,4 @@
-# RailMind 🚆🧠
+# RailMind
 
 [![CI](https://github.com/rakshit-737/Railmind/actions/workflows/ci.yml/badge.svg)](https://github.com/rakshit-737/Railmind/actions/workflows/ci.yml)
 
