@@ -64,9 +64,10 @@ class DigitalTwin:
         return copy.deepcopy(self)
 
     def close_track(self, track_id):
-        if track_id in self.state.tracks:
-            self.state.tracks[track_id].status = TrackStatus.CLOSED
-            self.state.tracks[track_id].health = 0.0
+        if track_id not in self.state.tracks:
+            raise ValueError(f"Unknown track id: {track_id}")
+        self.state.tracks[track_id].status = TrackStatus.CLOSED
+        self.state.tracks[track_id].health = 0.0
         self.graph.close_track(track_id)
 
     def find_route(self, source, destination):
@@ -93,10 +94,12 @@ class DigitalTwin:
               e.g. "reroute_TR00_via_NEW_DELHI_JAIPUR_JUNCT"
               The part after "_via_" is two or more station ids joined by
               underscores. Station ids may themselves contain underscores;
-              they are matched against the network with backtracking.
+              they are matched against the network with backtracking, and
+              every consecutive pair must be joined by a track.
 
-        Raises ValueError for unrecognised actions, unknown trains or
-        stations, or routes with fewer than two stations.
+        Raises ValueError for unrecognised actions, unknown trains, tracks
+        or stations, routes with fewer than two stations, or routes whose
+        stations are not connected by tracks.
         """
         if action_string.startswith("close_track_"):
             parts = action_string.split("close_track_")
@@ -125,28 +128,55 @@ class DigitalTwin:
         stations = set(self.graph.graph.nodes())
         tokens = route_part.split("_")
 
-        def parse(i):
+        def parse(i, prev, count):
+            # Longest match first, backtracking on failure. A candidate is
+            # accepted only if it names a station connected by a track to
+            # the previous one, and a complete parse must consume the whole
+            # suffix with at least two stations — so a greedy match that
+            # strands the route (e.g. a nested id swallowing "A_B" whole)
+            # is rejected in favour of a connected segmentation.
+            if i == len(tokens):
+                return [] if count >= 2 else None
+            for j in range(len(tokens), i, -1):
+                candidate = "_".join(tokens[i:j])
+                if candidate not in stations:
+                    continue
+                if prev is not None and not self.graph.graph.has_edge(prev, candidate):
+                    continue
+                rest = parse(j, candidate, count + 1)
+                if rest is not None:
+                    return [candidate] + rest
+            return None
+
+        route = parse(0, None, 0)
+        if route is not None:
+            return train_id, route
+
+        # Diagnose the failure: a membership-only segmentation tells unknown
+        # stations apart from known ones that just do not connect.
+        def parse_names_only(i):
             if i == len(tokens):
                 return []
-            # Longest match first, backtracking on failure
             for j in range(len(tokens), i, -1):
                 candidate = "_".join(tokens[i:j])
                 if candidate in stations:
-                    rest = parse(j)
+                    rest = parse_names_only(j)
                     if rest is not None:
                         return [candidate] + rest
             return None
 
-        route = parse(0)
-        if route is None:
+        names = parse_names_only(0)
+        if names is None:
             raise ValueError(
                 f"Unknown station in reroute action: {route_part!r}"
             )
-        if len(route) < 2:
+        if len(names) < 2:
             raise ValueError(
-                f"Reroute action needs at least 2 stations, got: {route}"
+                f"Reroute action needs at least 2 stations, got: {names}"
             )
-        return train_id, route
+        raise ValueError(
+            f"No track connects the stations in reroute action: {route_part!r}"
+        )
 
     def seed_trains(self, n):
         # Local RNG: keeps fleets deterministic without touching the
@@ -210,6 +240,10 @@ class DigitalTwin:
         rng = self._rng
 
         for train in self.state.trains.values():
+            # Every train draws its jitter each tick — held, turning around
+            # or moving — so forecast clones that hold trains stay on the
+            # same RNG stream as clones that do not.
+            jitter = rng.random()
             route = train.route
             if len(route) < 2:
                 continue
@@ -237,7 +271,7 @@ class DigitalTwin:
             if track.status == TrackStatus.DEGRADED:
                 speed_kmh *= 0.6
             step = (speed_kmh * (minutes * self.SIM_TIME_COMPRESSION) / 60.0) / max(track.length_km, 1.0)
-            step = min(1.0, step * (0.8 + 0.4 * rng.random()))
+            step = min(1.0, step * (0.8 + 0.4 * jitter))
             train.progress += step
             if track.status == TrackStatus.DEGRADED:
                 train.delayed_minutes += minutes * 0.5

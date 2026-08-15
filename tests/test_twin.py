@@ -34,6 +34,25 @@ def _two_station_twin(health=0.9):
     return DigitalTwin(build_network_from_data(stations, tracks))
 
 
+def _nested_id_twin():
+    # Station ids where one id ("A_B") is the underscore-join of two others,
+    # as live-OSM naming readily produces. Edges: A-B and B-A_B.
+    stations = [
+        {"station_id": "A", "name": "A", "lat": 0.0, "lon": 0.0},
+        {"station_id": "B", "name": "B", "lat": 1.0, "lon": 0.0},
+        {"station_id": "A_B", "name": "A B", "lat": 2.0, "lon": 0.0},
+    ]
+    tracks = [
+        {"track_id": "T1", "source": "A", "destination": "B",
+         "health": 0.9, "length_km": 50.0, "max_speed_kmh": 100.0},
+        {"track_id": "T2", "source": "B", "destination": "A_B",
+         "health": 0.9, "length_km": 50.0, "max_speed_kmh": 100.0},
+    ]
+    t = DigitalTwin(build_network_from_data(stations, tracks))
+    t.seed_trains(1)
+    return t
+
+
 def test_seed_trains_deterministic(twin):
     stations, tracks = load_bundled_network()
     other = DigitalTwin(build_network_from_data(stations, tracks))
@@ -180,6 +199,61 @@ def test_apply_reroute_action_rejects_malformed(twin):
         twin.apply_action(f"reroute_{tid}_via_NOPE_NOWHERE")  # unknown stations
     with pytest.raises(ValueError):
         twin.apply_action("reroute_GHOST_via_NEW_DELHI_JAIPUR_JUNCT")  # unknown train
+
+
+def test_apply_reroute_action_rejects_non_adjacent_route(twin):
+    # Both stations exist but no track joins them: the train must not teleport
+    tid = next(iter(twin.state.trains.keys()))
+    with pytest.raises(ValueError):
+        twin.apply_action(f"reroute_{tid}_via_NEW_DELHI_MUMBAI_CENTR")
+
+
+def test_reroute_parser_prefers_connected_segmentation():
+    # Greedy longest-match alone would read "A_B" as the single nested id and
+    # then fail the two-station rule; the connected parse [A, B] must win.
+    t = _nested_id_twin()
+    tid = next(iter(t.state.trains.keys()))
+    t.apply_action(f"reroute_{tid}_via_A_B")
+    assert t.state.trains[tid].route == ["A", "B"]
+
+
+def test_reroute_parser_resolves_genuine_nested_id():
+    # Here the nested id is really meant: B connects to A_B, not to [A, B]
+    # twice over, so the parse must keep "A_B" whole.
+    t = _nested_id_twin()
+    tid = next(iter(t.state.trains.keys()))
+    t.apply_action(f"reroute_{tid}_via_B_A_B")
+    assert t.state.trains[tid].route == ["B", "A_B"]
+
+
+def test_close_track_unknown_id_raises(twin):
+    with pytest.raises(ValueError):
+        twin.close_track("NOPE")
+    with pytest.raises(ValueError):
+        twin.apply_action("close_track_NOPE")
+
+
+def test_held_trains_do_not_desync_rng_stream(twin):
+    # Two clones on the same seed, one holding a train at a closed track:
+    # every train must consume one jitter draw per tick regardless, so the
+    # ambient randomness stays in lockstep across scenarios.
+    a = twin.copy()
+    b = twin.copy()
+    a._rng = random.Random(7)
+    b._rng = random.Random(7)
+
+    train = next(iter(b.state.trains.values()))
+    nxt = train.route[train.route_index + 1]
+    track = b._track_between(train.current_station, nxt)
+    b.close_track(track.track_id)
+
+    for _ in range(10):
+        a.tick()
+        b.tick()
+    assert b.state.trains[train.train_id].held is True
+    assert a.state.weather == b.state.weather
+    # Sentinel draw: both RNG streams sit at the same position
+    assert a._rng.random() == b._rng.random()
 
 
 def test_simulator_differentiates_closure_from_do_nothing(twin):
