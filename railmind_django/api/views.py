@@ -37,21 +37,29 @@ def _build_default_twin():
     return twin
 
 
-def get_twin(request):
+def _session_id(request):
+    return request.headers.get("X-Session-ID", "default")
+
+
+def _resolve_twin(session_id):
     """
-    Fetch the twin for this session, creating the default twin on first use.
+    Fetch the twin for a session, creating the default twin on first use.
+
+    The caller MUST already hold _twin_lock: keeping lookup and use in one
+    critical section stops a concurrent /api/reset/ from swapping
+    twin_sessions between lookup and mutation (which would silently mutate
+    an orphaned twin). _twin_lock is a plain Lock (not reentrant), so this
+    helper must never try to acquire it itself.
 
     Args:
-        request: The HTTP request object containing headers.
+        session_id: The session id from the X-Session-ID header.
 
     Returns:
         DigitalTwin: The digital twin session instance if found, otherwise None.
     """
-    session_id = request.headers.get("X-Session-ID", "default")
-    with _twin_lock:
-        if session_id == "default" and "default" not in twin_sessions:
-            twin_sessions["default"] = _build_default_twin()
-        return twin_sessions.get(session_id)
+    if session_id == "default" and "default" not in twin_sessions:
+        twin_sessions["default"] = _build_default_twin()
+    return twin_sessions.get(session_id)
 
 
 @api_view(['GET'])
@@ -77,12 +85,12 @@ def get_state(request):
     }
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     # Living twin: state reads advance the simulation (no background thread)
     with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
         twin.maybe_tick()
         state_dump = twin.get_state()
 
@@ -126,12 +134,12 @@ def copy_twin(request):
     future = twin.copy()
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     new_session_id = str(uuid.uuid4())
     with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
         twin_sessions[new_session_id] = twin.copy()
         sandbox_ids = [sid for sid in twin_sessions if sid != "default"]
         for sid in sandbox_ids[:max(0, len(sandbox_ids) - MAX_SANDBOX_SESSIONS)]:
@@ -157,16 +165,18 @@ def close_track(request):
     close_track("T14")
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     track_id = request.data.get("track_id")
     if not track_id:
         return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(track_id, str):
+        return Response({"error": "track_id must be a string"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
             if track_id not in twin.state.tracks:
                 return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
             # Utilizing existing string-based apply_action for closure
@@ -188,17 +198,19 @@ def set_weather(request):
     set_weather("T05", "STORM")
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     track_id = request.data.get("track_id")
     condition = request.data.get("condition", "CLEAR")
     if not track_id:
         return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(track_id, str):
+        return Response({"error": "track_id must be a string"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
             twin.set_weather(track_id, str(condition).upper())
     except ValueError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -219,18 +231,24 @@ def find_route(request):
     find_route("A", "C")
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     source = request.data.get("source")
     destination = request.data.get("destination")
 
     if not source or not destination:
         return Response({"error": "Missing source or destination"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(source, str) or not isinstance(destination, str):
+        return Response(
+            {"error": "source and destination must be station id strings"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
-        route = twin.graph.find_route(source, destination)
+        with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
+            route = twin.graph.find_route(source, destination)
     except ValueError as e:
         return Response({"route": None, "error": str(e)}, status=status.HTTP_404_NOT_FOUND)
 
@@ -250,25 +268,32 @@ def reroute_train(request):
     reroute_train("TR01", ["A", "B", "C"])
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     train_id = request.data.get("train_id")
     route = request.data.get("route")
 
-    if not train_id or not route or not isinstance(route, list):
+    if not train_id or not route:
         return Response({"error": "Missing train_id or invalid route array"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(train_id, str):
+        return Response({"error": "train_id must be a string"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(route, list) or not all(isinstance(s, str) for s in route):
+        return Response(
+            {"error": "route must be a list of station id strings"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
         with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
             if train_id not in twin.state.trains:
                 return Response({"error": "Train ID not found"}, status=status.HTTP_404_NOT_FOUND)
 
             unknown = [s for s in route if s not in twin.state.stations]
             if unknown:
                 return Response(
-                    {"error": f"Unknown station id(s): {', '.join(str(s) for s in unknown)}"},
+                    {"error": f"Unknown station id(s): {', '.join(unknown)}"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -296,23 +321,21 @@ def apply_action(request):
     ```python
     apply_action("close_track_T14")
 
-    apply_action("reroute_via_route_A")
+    apply_action("reroute_TR00_via_NEW_DELHI_JAIPUR_JUNCT")
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
-
     action = request.data.get("action")
     if not action:
         return Response({"error": "Missing action string"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(action, str):
+        return Response({"error": "action must be a string"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        if action.startswith("reroute_"):
-            # Mock fallback for string-based rerouting
-            return Response({"status": "acknowledged", "action": action, "note": "Use reroute_train endpoint for concrete routing."})
-
         with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
             if action.startswith("close_track_"):
                 # The twin silently no-ops on unknown ids; reject them here,
                 # consistent with the /api/track/close/ endpoint.
@@ -320,6 +343,8 @@ def apply_action(request):
                 if track_id not in twin.state.tracks:
                     return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
 
+            # reroute_* actions run through the core grammar too; the twin
+            # raises ValueError on unknown trains/stations or bad routes.
             twin.apply_action(action)
         return Response({"status": "success", "action": action})
     except ValueError as e:
@@ -336,11 +361,12 @@ def calculate_delay(request):
     delay_minutes
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
-    delay = twin.calculate_delay()
+        delay = twin.calculate_delay()
     return Response({"delay_minutes": delay})
 
 
@@ -356,9 +382,10 @@ def calculate_risk(request):
     risk_score
     ```
     """
-    twin = get_twin(request)
-    if not twin:
-        return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
-    risk = twin.calculate_risk()
+        risk = twin.calculate_risk()
     return Response({"risk_score": risk})
