@@ -48,10 +48,17 @@ try:
 except ImportError:
     anthropic = None
 
-# Make the repo root importable so the embedded twin fallback works offline.
+# Make the repo root importable so the embedded twin fallback works offline,
+# and this directory importable so sibling modules resolve however uvicorn was
+# launched (from agents/ or from the repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
+AGENTS_DIR = Path(__file__).resolve().parent
+for _path in (REPO_ROOT, AGENTS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
+
+import escalation as esc                      # noqa: E402  (needs sys.path above)
+from briefing import handoff_brief            # noqa: E402
 
 app = FastAPI(
     title="RailMind Agents",
@@ -86,6 +93,35 @@ MCDM_WEIGHTS = {
     "passenger_impact": 0.15,
     "congestion":       0.10,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESCALATION LEDGER
+# One ledger per process, guarded by its own lock: it is read by the console's
+# polling loop and written by the pipeline and by /apply-plan, all of which
+# FastAPI may run concurrently on its threadpool. The lock is never held across
+# network I/O — snapshots are fetched first, then folded in.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LEDGER = esc.IncidentLedger()
+_ledger_lock = threading.RLock()
+
+# The role a plan executed from the console is attributed to. Real deployments
+# would take this from the authenticated operator; the demo has one desk.
+CONSOLE_OPERATOR = "Console Operator"
+
+
+def _observe(snapshot: dict) -> dict:
+    with _ledger_lock:
+        return _LEDGER.observe(snapshot)
+
+
+def _find_incident(incident_id: str) -> dict:
+    """Return one incident's payload, 404ing if the ledger has never seen it."""
+    with _ledger_lock:
+        payload = _LEDGER.incident_payload(incident_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")
+    return payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +296,7 @@ class RailState(TypedDict):
     plans:                  List[dict]              # Planner output
     simulation_results:     List[dict]              # Simulation output
     best_plan:              dict                    # Master output
+    escalation:             dict                    # Escalation output
 
     log:                    List[dict]              # {t, source, message}
 
@@ -832,6 +869,36 @@ def master_node(state: RailState) -> RailState:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ESCALATION AGENT
+# Reads  : snapshot (via the ledger), plus whatever the run already decided
+# Outputs: escalation — tier, owner, and a COMPLETE/PARTIAL/BLOCKED/UNRESOLVED
+#          completion signal per open incident
+# Runs last on purpose: it grades the state of the world the other agents just
+# reasoned about, including work committed by earlier runs of this pipeline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def escalation_node(state: RailState) -> RailState:
+    payload = _observe(state["snapshot"])
+    state["escalation"] = payload
+
+    totals = payload["totals"]
+    if not totals["open"]:
+        _log(state, "Escalation", "no open incidents — handling level L0 Steady State")
+        return state
+
+    worst = max(
+        payload["incidents"],
+        key=lambda i: (esc.RESOLUTION_SEVERITY.get(i["resolution"], 0), i["level"]),
+        default=None,
+    )
+    _log(state, "Escalation",
+         f"{payload['code']} {payload['label']} · owner {payload['owner']} | "
+         f"{totals['open']} open incident(s) | completion {payload['resolution']}"
+         + (f" — {worst['id']} {worst['resolution_reason']}" if worst else ""))
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LANGGRAPH PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -852,6 +919,7 @@ for _name, _fn in [
     ("planner",    planner_node),
     ("simulation", simulation_node),
     ("master",     master_node),
+    ("escalation", escalation_node),
 ]:
     _builder.add_node(_name, _fn)
 
@@ -864,7 +932,8 @@ for _a, _b in [
     ("routing",    "planner"),
     ("planner",    "simulation"),
     ("simulation", "master"),
-    ("master",     END),
+    ("master",     "escalation"),
+    ("escalation", END),
 ]:
     _builder.add_edge(_a, _b)
 
@@ -887,6 +956,7 @@ def _initial_state(snapshot: dict, extra_log: List[dict] | None = None) -> RailS
         plans=[],
         simulation_results=[],
         best_plan={},
+        escalation={},
         log=extra_log or [],
     )
 
@@ -972,7 +1042,7 @@ def _template_explanation(final: RailState) -> str:
 
 
 def _llm_explanation(final: RailState) -> str | None:
-    """Ask Claude for a dispatcher-style justification. Returns None when the
+    """Ask the language model for a dispatcher-style justification. Returns None when the
     API key is absent or the call fails — callers fall back to the template."""
     if anthropic is None or not os.environ.get("ANTHROPIC_API_KEY"):
         return None
@@ -1017,7 +1087,7 @@ def _llm_explanation(final: RailState) -> str | None:
 def _explanation(final: RailState, use_llm: bool = True) -> dict:
     llm_text = _llm_explanation(final) if use_llm else None
     if llm_text:
-        return {"text": llm_text.strip(), "source": "claude"}
+        return {"text": llm_text.strip(), "source": "llm"}
     return {"text": _template_explanation(final), "source": "rules"}
 
 
@@ -1092,6 +1162,10 @@ def _format_response(final: RailState, twin_source: str, use_llm: bool = True) -
         "rerouted_trains": rerouted_trains,
         "held_trains": held_trains,
         "trains": trains,
+        # Always present: /apply-plan re-grades the ledger after executing, and
+        # a cached run replayed through this formatter must not serve the
+        # escalation state as it stood before the actions landed.
+        "escalation": final.get("escalation") or _observe(final["snapshot"]),
     }
 
 
@@ -1132,9 +1206,69 @@ def health():
         "status": "ok",
         "endpoints": [
             "/state", "/run", "/run-stream", "/apply-plan", "/reset",
-            "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}", "/docs",
+            "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}",
+            "/escalation", "/incidents/{incident_id}/acknowledge",
+            "/incidents/{incident_id}/brief", "/docs",
         ],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESCALATION ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/escalation")
+def escalation_state():
+    """Current handling level and the completion signal for every incident.
+
+    Cheap enough for the console to poll: it folds one twin snapshot into the
+    ledger, re-verifies committed work against that snapshot, and returns the
+    graded result. No LLM call — briefs are requested explicitly.
+    """
+    snapshot, source = fetch_snapshot()
+    payload = _observe(snapshot)
+    return {"twin_source": source, **payload}
+
+
+@app.post("/incidents/{incident_id}/acknowledge")
+def acknowledge_incident(incident_id: str, owner: str = CONSOLE_OPERATOR):
+    """Take ownership at the current tier and restart that tier's dwell timer.
+
+    Acknowledging is not resolving: the incident keeps its completion signal,
+    and condition-driven escalation still applies. It only stops the clock from
+    escalating work somebody is demonstrably handling.
+    """
+    with _ledger_lock:
+        try:
+            _LEDGER.acknowledge(incident_id, owner)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")
+
+    snapshot, source = fetch_snapshot()
+    payload = _observe(snapshot)
+    return {
+        "status": "success",
+        "incident_id": incident_id,
+        "acknowledged_by": owner,
+        "twin_source": source,
+        **payload,
+    }
+
+
+@app.post("/incidents/{incident_id}/brief")
+def incident_brief(incident_id: str):
+    """Draft the handoff brief that travels with this incident to its owner.
+
+    The language model writes it when a key is configured; otherwise a deterministic
+    template produces the same four sections from the same numbers. The
+    response says which, so the console can label it honestly.
+    """
+    snapshot, _ = fetch_snapshot()
+    payload = _observe(snapshot)
+    incident = next((i for i in payload["incidents"] if i["id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")
+    return handoff_brief(payload, incident)
 
 
 @app.get("/state")
@@ -1176,8 +1310,12 @@ def reset():
     """Reset the twin to its baseline state (clears failures, weather, reroutes)."""
     # Clear cached plans first — even a partially failed reset has already
     # replaced the embedded twin, and /apply-plan must never re-close tracks
-    # the reset just reopened.
+    # the reset just reopened. The ledger goes with them: its incidents and
+    # work items describe a world that no longer exists, and a stale BLOCKED
+    # incident would keep the console at L4 over a healthy network.
     _clear_last_run()
+    with _ledger_lock:
+        _LEDGER.reset()
     try:
         _twin_reset()
     except requests.RequestException as e:
@@ -1393,6 +1531,28 @@ def apply_plan(plan_id: str | None = None):
         "t": time.strftime("%H:%M:%S"),
         "source": "Executor",
         "message": message,
+    })
+
+    # Register what this plan committed to, then re-grade against a FRESH
+    # snapshot. Registering every action — not just the ones the apply loop
+    # reported — is the point: an action that never landed must show as
+    # outstanding work, not vanish from the checklist.
+    post_snapshot, source = fetch_snapshot()
+    with _ledger_lock:
+        _LEDGER.record_dispatch(target_id, plan["actions"], post_snapshot)
+        graded = _LEDGER.observe(post_snapshot)
+    final["escalation"] = graded
+    final["snapshot"] = post_snapshot
+    worst = max(
+        graded["incidents"],
+        key=lambda i: (esc.RESOLUTION_SEVERITY.get(i["resolution"], 0), i["level"]),
+        default=None,
+    )
+    final["log"].append({
+        "t": time.strftime("%H:%M:%S"),
+        "source": "Escalation",
+        "message": (f"post-execution completion signal: {graded['resolution']}"
+                    + (f" — {worst['id']} {worst['resolution_reason']}" if worst else "")),
     })
     # Template-only explanation: the apply path must answer fast — actions are
     # already applied to the twin, so a slow LLM call would make the console

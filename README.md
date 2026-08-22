@@ -35,12 +35,16 @@ A **digital twin** of a 21-station Indian railway network feeds a **LangGraph pi
         shared canonical         │                   │                  │
         network dataset          │            Master Agent              │
    railmind/data/                │      (min-max MCDM ranking)          │
-   india_network.json            └───────────────────┬──────────────────┘
+   india_network.json            │                   │                  │
+                                 │        Escalation Ledger             │
+                                 │   (L0-L4 ladder · COMPLETE /         │
+                                 │    PARTIAL / BLOCKED / UNRESOLVED)   │
+                                 └───────────────────┬──────────────────┘
                                                      │ REST (CORS)
                                  ┌───────────────────▼──────────────────┐
                                  │  Operator Console (React + Vite)     │
                                  │  :8080 — live map, fleet, plans,     │
-                                 │  agent timeline, failure injection   │
+                                 │  timeline, escalation tracker        │
                                  └──────────────────────────────────────┘
 ```
 
@@ -48,7 +52,7 @@ A **digital twin** of a 21-station Indian railway network feeds a **LangGraph pi
 |---|---|---|
 | Core engine (twin, graph, simulator) | Python, NetworkX, Pydantic | [`railmind/`](railmind/) |
 | Digital twin API | Django + DRF (+ Swagger docs) | [`railmind_django/`](railmind_django/) |
-| Agent orchestrator | FastAPI + LangGraph | [`agents/`](agents/) |
+| Agent orchestrator + escalation ledger | FastAPI + LangGraph | [`agents/`](agents/) |
 | Operator console | React 19, TanStack Start, Tailwind | [`railmind-projec/`](railmind-projec/) |
 
 All layers share one canonical network — [`railmind/data/india_network.json`](railmind/data/india_network.json) — so station and track IDs line up end to end.
@@ -63,7 +67,7 @@ All layers share one canonical network — [`railmind/data/india_network.json`](
 docker compose up
 ```
 
-Twin on :8000, agents on :8001, console on http://localhost:8080. Set `ANTHROPIC_API_KEY` in your environment first if you want Claude-written plan explanations.
+Twin on :8000, agents on :8001, console on http://localhost:8080. Set `ANTHROPIC_API_KEY` in your environment first if you want LLM-written plan explanations.
 
 ### Option B — local dev (three terminals)
 
@@ -117,11 +121,12 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
    - agent decisions **stream into the timeline live** as the pipeline thinks,
    - the failed track turns red; any train approaching it is **HELD** (red, delay accruing),
    - three candidate plans appear, scored 0–100 — **click each one to preview** its closures and reroutes on the map,
-   - the Master Agent explains its choice in plain language (Claude-written when `ANTHROPIC_API_KEY` is set).
+   - the Master Agent explains its choice in plain language (LLM-written when `ANTHROPIC_API_KEY` is set).
 3. Click **Execute Recommended Plan on Live Twin** — reroutes are applied to the real twin. Held trains start moving along their alternate corridors within seconds; re-running the pipeline confirms nothing is left to fix. The loop is closed.
-4. Stack a cascade: inject a second failure, then click **Storm** — scenarios accumulate and the plans get harder. The **Run Analytics** panel charts score and delay across your runs.
-5. The **↺** button resets the twin to baseline between demos.
-6. URL shortcuts: `/?autorun` runs the pipeline on load, `/?inject=T23` injects a failure on load.
+4. Watch the **escalation rail** the whole time. The incident opens at L1, escalates to L3 the moment a train is brought to a stand, and the **Escalation Tracker** answers the question a dashboard usually leaves open: is the response finished? Before execution it reads `UNRESOLVED`; after it reads `PARTIAL` with `2/2 actions verified`, and the ladder de-escalates on its own. Leave an incident alone and the dwell clock escalates it without anybody touching the console. **Acknowledge** takes ownership; **Draft handoff brief** writes the note that travels with it.
+5. Stack a cascade: inject a second failure, then click **Storm** — scenarios accumulate and the plans get harder. The **Run Analytics** panel charts score and delay across your runs.
+6. The **↺** button resets the twin to baseline between demos.
+7. URL shortcuts: `/?autorun` runs the pipeline on load, `/?inject=T23` injects a failure on load.
 
 ---
 
@@ -135,6 +140,20 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 2. **Planner** composes three doctrines: **A — Safety First**, **B — Balanced Response**, **C — Minimal Intervention**. Weather response scales with the doctrine: A carries emergency closures (with reroutes around them), B speed restrictions, C monitoring only — so approving "Minimal Intervention" never executes an emergency closure.
 3. **Simulation engine** plays each plan against the incident snapshot with a twin-informed cost model — delay, residual risk, passenger impact and congestion, including stranded-train penalties for plans that ignore failures. (The core engine's `railmind/simulator.py` additionally forecasts scenarios by cloning the twin and ticking it forward — that clone-and-advance path backs the CLI demo.)
 4. **Master Agent** min-max normalises the four criteria and ranks plans with MCDM weights (risk 0.40, delay 0.35, passengers 0.15, congestion 0.10) → one recommended action with a 0–100 suitability score.
+5. **Escalation ledger** grades what happens next. Every incident carries a handling level — **L0 Steady State → L1 Advisory → L2 Elevated → L3 Critical → L4 Emergency** — that rises when the network deteriorates *or* when the dwell clock at the current level runs out, and falls again on genuine recovery. Each movement records the driver that caused it and the role that now owns it.
+
+## The completion signal
+
+Every open incident reports one of four states, recomputed from the live twin on every poll — never from the fact that a button was pressed:
+
+| State | Meaning |
+|---|---|
+| `COMPLETE` | Every affected train recovered, every committed action verified on the twin, and the failure itself contained. |
+| `PARTIAL` | Some committed work is verified and some is not; recovery is genuinely under way. |
+| `BLOCKED` | No open corridor remains for the trains still stuck. Another plan cannot fix it — track restoration can. Outranks `PARTIAL` so nobody waits on impossible work. |
+| `UNRESOLVED` | Nothing has landed yet: no action verified, no train recovered. |
+
+Each action an approved plan commits to becomes a **work item** (`DONE` / `PENDING` / `FAILED` / `BLOCKED`) that is re-verified against the twin on every observation. An apply that returned success but whose reroute never landed reads `PENDING`, and its incident stays `PARTIAL` — the console cannot report work it cannot prove.
 
 ---
 
@@ -154,6 +173,9 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 | Agents | `POST /simulate-weather/{track_id}?condition=STORM` | Persistently inject weather, then run the pipeline |
 | Agents | `POST /apply-plan` | Execute a plan on the live twin (closes tracks, applies reroutes) |
 | Agents | `POST /reset` | Reset the twin to baseline |
+| Agents | `GET /escalation` | Handling level, owner, and the completion signal for every incident |
+| Agents | `POST /incidents/{id}/acknowledge` | Take ownership at the current tier and restart its dwell clock |
+| Agents | `POST /incidents/{id}/brief` | Draft the handoff brief for the receiving controller |
 
 ---
 
@@ -168,7 +190,7 @@ python railmind/plot_results.py  # network + scenario charts (needs matplotlib)
 | Variable | Where | Default | Effect |
 |---|---|---|---|
 | `TWIN_BASE_URL` | agents | auto-discover | Point the orchestrator at a specific twin |
-| `ANTHROPIC_API_KEY` | agents | unset | Claude-written plan explanations (rule-engine fallback otherwise) |
+| `ANTHROPIC_API_KEY` | agents | unset | LLM-written plan explanations (rule-engine fallback otherwise) |
 | `VITE_API_BASE_URL` | console | `http://127.0.0.1:8001` | Agent service URL |
 | `RAILMIND_LIVE_OSM` | core | off | Load the real network from OpenStreetMap (Overpass) instead of the bundled dataset; results are cached, failures fall back offline |
 | `DJANGO_SECRET_KEY` · `DJANGO_DEBUG` · `DJANGO_ALLOWED_HOSTS` | twin | dev-friendly defaults | Production hardening — `render.yaml` sets all three on deploy; local dev needs none |
@@ -186,4 +208,4 @@ python -m pytest -q            # on Windows: PYTHONUTF8=1 python -m pytest -q
 cd railmind-projec && npm install && npm test
 ```
 
-The suite is hermetic — an exported `ANTHROPIC_API_KEY` is stripped so tests never call the real API. CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/test/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.
+The suite is hermetic — an exported `ANTHROPIC_API_KEY` is stripped so tests never call the real API. 123 backend tests and 19 console tests; CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/test/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.

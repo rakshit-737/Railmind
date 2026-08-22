@@ -42,9 +42,15 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { NetworkMap } from "./NetworkMap";
 import { TrainsPanel, getTrainRoute } from "./TrainsPanel";
+import { EscalationRail, IncidentTracker } from "./EscalationPanel";
 import { TRACKS, TRAINS, stationName, type Train as TrainType } from "@/lib/railmind-data";
 import {
+  acknowledgeIncident,
   applyPlan,
+  buildMockBrief,
+  buildMockEscalation,
+  draftBrief,
+  fetchEscalation,
   fetchLiveState,
   incidentSummary,
   injectTrackFailure,
@@ -52,6 +58,9 @@ import {
   resetTwin,
   runSimulation,
   runSimulationStream,
+  STEADY_STATE,
+  type Escalation,
+  type HandoffBrief,
   type LiveState,
   type LogEvent,
   type Plan,
@@ -126,6 +135,10 @@ export function Dashboard() {
   const [selectedPlan, setSelectedPlan] = useState<string | null>(null);
   const [live, setLive] = useState<LiveState | null>(null);
   const [liveLog, setLiveLog] = useState<LogEvent[]>([]);
+  // Escalation ledger. `null` means the backend never answered — the console
+  // then grades locally from the mock run so the ladder is never blank.
+  const [escalation, setEscalation] = useState<Escalation | null>(null);
+  const [escalationOffline, setEscalationOffline] = useState(false);
   const [history, setHistory] = useState<RunRecord[]>([]);
   const [offlineTrains, setOfflineTrains] = useState<TrainType[]>(() =>
     TRAINS.map((t) => ({ ...t, current_station: t.route[0], route_index: 0, progress: 0 })),
@@ -198,6 +211,98 @@ export function Dashboard() {
     };
   }, [refreshLive]);
 
+  // ── Escalation ledger polling ────────────────────────────────────────────
+  // Separate from /state on purpose: grading re-verifies committed work and
+  // runs the dwell clock, so it must keep ticking while nothing else moves —
+  // an untouched incident escalates on time even with the operator idle.
+  const refreshEscalation = useCallback(async () => {
+    const next = await fetchEscalation();
+    if (next) {
+      setEscalation(next);
+      setEscalationOffline(false);
+    }
+    return next;
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      if (busyRef.current) return;
+      const next = await refreshEscalation();
+      if (stopped || next) return;
+      // Backend silent: fall back to grading the last run locally, so the
+      // ladder degrades with the rest of the console instead of disappearing.
+      setEscalationOffline(true);
+      setEscalation((prev) => prev ?? STEADY_STATE);
+    };
+    void poll();
+    const id = setInterval(() => void poll(), 4000);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  }, [refreshEscalation]);
+
+  const adoptEscalation = useCallback((r: RunResponse | null, executed = false) => {
+    if (r?.escalation) {
+      setEscalation(r.escalation);
+      setEscalationOffline(false);
+      return;
+    }
+    if (r) {
+      setEscalation(buildMockEscalation(r, executed));
+      setEscalationOffline(true);
+    }
+  }, []);
+
+  const onAcknowledge = useCallback(async (incidentId: string) => {
+    const next = await acknowledgeIncident(incidentId);
+    if (next) {
+      setEscalation(next);
+      setEscalationOffline(false);
+      return;
+    }
+    // Offline: acknowledging is still a real operator act — record it
+    // locally so ownership shows, and label the ledger as fallback.
+    setEscalation((prev) =>
+      prev
+        ? {
+            ...prev,
+            incidents: prev.incidents.map((i) =>
+              i.id === incidentId
+                ? {
+                    ...i,
+                    acknowledged_by: "Console Operator (local)",
+                    tier_age_seconds: 0,
+                    events: [
+                      ...i.events,
+                      {
+                        at: new Date().toTimeString().slice(0, 8),
+                        from: i.code,
+                        to: i.code,
+                        reason: "Acknowledged on the console while the ledger was unreachable.",
+                        kind: "acknowledged",
+                      },
+                    ],
+                  }
+                : i,
+            ),
+          }
+        : prev,
+    );
+    setEscalationOffline(true);
+  }, []);
+
+  const onBrief = useCallback(
+    async (incidentId: string): Promise<HandoffBrief | null> => {
+      const real = await draftBrief(incidentId);
+      if (real) return real;
+      const incident = escalation?.incidents.find((i) => i.id === incidentId);
+      return incident ? buildMockBrief(incident) : null;
+    },
+    [escalation],
+  );
+
   const recordRun = useCallback((r: RunResponse) => {
     setHistory((prev) => [
       ...prev,
@@ -244,6 +349,7 @@ export function Dashboard() {
             : await fallback());
         setData(result);
         recordRun(result);
+        adoptEscalation(result);
         await refreshLive();
       } finally {
         setStreaming(false);
@@ -251,7 +357,7 @@ export function Dashboard() {
         busyRef.current = false;
       }
     },
-    [recordRun, refreshLive],
+    [adoptEscalation, recordRun, refreshLive],
   );
 
   const doRun = useCallback(() => execute({}, runSimulation), [execute]);
@@ -273,6 +379,9 @@ export function Dashboard() {
       if (result) {
         setData(result);
         recordRun(result);
+        // The apply response carries the ledger's post-execution grade: what
+        // the twin actually confirms, not what the executor reported.
+        adoptEscalation(result, true);
         setSelectedPlan(null);
         await refreshLive();
       } else if (data) {
@@ -292,6 +401,7 @@ export function Dashboard() {
             ...data.execution_log,
           ],
         });
+        adoptEscalation(data, true);
         setSelectedPlan(null);
       }
     } finally {
@@ -311,7 +421,10 @@ export function Dashboard() {
         setLiveLog([]);
         setSelectedPlan(null);
         setSelectedTrain(null);
-        await refreshLive();
+        // The backend ledger was cleared with the twin; mirror that locally
+        // so a resolved incident cannot linger on the rail.
+        setEscalation(STEADY_STATE);
+        await Promise.all([refreshLive(), refreshEscalation()]);
         return;
       }
       // The render-closure `live` can be seconds stale by now (busyRef pauses
@@ -330,6 +443,8 @@ export function Dashboard() {
         setLiveLog([]);
         setSelectedPlan(null);
         setSelectedTrain(null);
+        setEscalation(STEADY_STATE);
+        setEscalationOffline(true);
       } else {
         // Reset never reached the twin — wiping the console here would desync
         // it from the twin's real state, so keep everything and say so.
@@ -365,11 +480,17 @@ export function Dashboard() {
   }, []);
 
   const incident = useMemo(() => incidentSummary(data), [data]);
-  const status: "operational" | "warning" | "incident" = !data
-    ? "operational"
-    : incident
+  // An incident the ledger holds but this session has not run a pipeline for.
+  const ledgerIncident = (escalation?.incidents ?? []).find((i) => !i.closed) ?? null;
+  // Status follows the ledger as well as this session's run: an incident open
+  // on the backend must not sit under an OPERATIONAL header just because this
+  // browser has not run the pipeline itself.
+  const status: "operational" | "warning" | "incident" =
+    incident || (ledgerIncident?.level ?? 0) >= 3
       ? "incident"
-      : "warning";
+      : data || ledgerIncident
+        ? "warning"
+        : "operational";
 
   const plans: Plan[] = data?.candidate_plans ?? [];
   const scores = plans.map((p) => p.score);
@@ -500,6 +621,9 @@ export function Dashboard() {
       </header>
 
       <main className="mx-auto max-w-[1600px] px-5 py-5 grid grid-cols-12 gap-4">
+        {/* Escalation rail — handling level, owner, completion signal */}
+        <EscalationRail escalation={escalation} offline={escalationOffline} />
+
         {/* Incident */}
         <Card
           className={`col-span-12 lg:col-span-3 p-4 glass ${incident ? "glow-red" : "glow-green"}`}
@@ -555,11 +679,24 @@ export function Dashboard() {
             </div>
           ) : (
             <div className="mt-6 flex flex-col items-center text-center py-4">
-              <CheckCircle2 className="h-10 w-10 text-success mb-2" />
-              <div className="font-semibold">No Active Incidents</div>
-              <div className="text-xs text-muted-foreground mt-1">
-                All systems nominal across the network.
-              </div>
+              {ledgerIncident ? (
+                <>
+                  <ShieldAlert className="h-10 w-10 text-warning mb-2" />
+                  <div className="font-semibold">Open on the ledger</div>
+                  <div className="text-xs text-muted-foreground mt-1">
+                    {ledgerIncident.corridor} is at {ledgerIncident.code}{" "}
+                    {ledgerIncident.tier_label}. Run the pipeline to generate response plans.
+                  </div>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="h-10 w-10 text-success mb-2" />
+                  <div className="font-semibold">No Active Incidents</div>
+                  <div className="text-xs text-muted-foreground mt-1">
+                    All systems nominal across the network.
+                  </div>
+                </>
+              )}
             </div>
           )}
         </Card>
@@ -784,7 +921,7 @@ export function Dashboard() {
                       Why this plan
                     </span>
                     <Badge variant="outline" className="ml-auto font-mono-mc text-[9px]">
-                      {data.explanation.source === "claude" ? "CLAUDE AI" : "RULE ENGINE"}
+                      {data.explanation.source === "llm" ? "LLM" : "RULE ENGINE"}
                     </Badge>
                   </div>
                   <p className="text-xs leading-relaxed text-foreground/90">
@@ -847,6 +984,15 @@ export function Dashboard() {
             </div>
           )}
         </Card>
+
+        {/* Escalation tracker — per-incident completion signal and work */}
+        <IncidentTracker
+          escalation={escalation}
+          offline={escalationOffline}
+          onAcknowledge={onAcknowledge}
+          onBrief={onBrief}
+          busy={loading}
+        />
 
         {/* Timeline */}
         <Card className="col-span-12 xl:col-span-7 p-0 glass overflow-hidden">

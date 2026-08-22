@@ -12,7 +12,7 @@ for p in (REPO_ROOT, REPO_ROOT / "agents"):
 
 @pytest.fixture(autouse=True)
 def _hermetic_env(monkeypatch):
-    # Tests must never hit the real Claude API just because the developer has
+    # Tests must never hit the real LLM API just because the developer has
     # a key exported; the LLM path is exercised via monkeypatched stubs only.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("TWIN_BASE_URL", raising=False)

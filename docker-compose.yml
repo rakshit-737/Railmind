@@ -17,7 +17,7 @@ services:
       dockerfile: agents/Dockerfile
     environment:
       TWIN_BASE_URL: http://twin:8000
-      # Optional: enables Claude-written plan explanations
+      # Optional: enables LLM-written plan explanations
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "8001:8001"

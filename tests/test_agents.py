@@ -117,8 +117,11 @@ def test_execution_log_has_structured_entries():
     assert len(resp["execution_log"]) >= 5
     for entry in resp["execution_log"]:
         assert set(entry) == {"t", "source", "message"}
-    # Newest first: Master's selection is the first entry
-    assert resp["execution_log"][0]["source"] == "Master"
+    # Newest first: Escalation grades the world after Master has chosen, so it
+    # is the last stage to log and therefore the first entry.
+    sources = [e["source"] for e in resp["execution_log"]]
+    assert sources[0] == "Escalation"
+    assert sources.index("Escalation") < sources.index("Master")
 
 
 def test_twin_reset_clears_embedded_even_with_remote_base(monkeypatch):
@@ -156,7 +159,7 @@ def test_format_response_use_llm_false_skips_llm(monkeypatch):
     assert resp["explanation"]["source"] == "rules"
     assert not calls
     resp2 = all_agent._format_response(final, "embedded")
-    assert resp2["explanation"] == {"text": "LLM TEXT", "source": "claude"}
+    assert resp2["explanation"] == {"text": "LLM TEXT", "source": "llm"}
     assert calls
 
 
@@ -239,10 +242,15 @@ def test_apply_plan_executes_the_approved_cached_plan(embedded_only, monkeypatch
     # execute a different plan under the same letter.
     all_agent._reset_embedded_twin()
 
-    def _no_refetch():
-        raise AssertionError("cached apply must not re-run the pipeline")
+    # Apply re-reads the twin afterwards to grade what actually landed, so the
+    # invariant under test is narrower than "no I/O": the *pipeline* must not
+    # run again, because a recompute would see no failure and execute a
+    # different plan under the same letter.
+    class _ExplodingPipeline:
+        def invoke(self, *_args, **_kwargs):
+            raise AssertionError("cached apply must not re-run the pipeline")
 
-    monkeypatch.setattr(all_agent, "fetch_snapshot", _no_refetch)
+    monkeypatch.setattr(all_agent, "pipeline", _ExplodingPipeline())
     resp = all_agent.apply_plan()
     assert resp["executed_plan"] == best_id
     for entry in expected_reroutes:

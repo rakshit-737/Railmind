@@ -39,7 +39,90 @@ export type Plan = {
 
 export type LogEvent = { t: string; source: string; message: string };
 
-export type Explanation = { text: string; source: "claude" | "rules" | string };
+// ── Escalation ladder and completion signal ─────────────────────────────────
+
+/** COMPLETE / PARTIAL / BLOCKED / UNRESOLVED — see the backend's escalation.py. */
+export type Resolution = "COMPLETE" | "PARTIAL" | "BLOCKED" | "UNRESOLVED";
+export type WorkState = "DONE" | "PENDING" | "FAILED" | "BLOCKED";
+export type Disposition = "RECOVERED" | "HELD" | "EXPOSED" | "BLOCKED";
+
+export type WorkItem = {
+  id: string;
+  kind: "close_track" | "reroute" | "hold" | "weather_closure" | string;
+  label: string;
+  target: string;
+  incident_id: string | null;
+  state: WorkState;
+  detail: string;
+  plan_id?: string | null;
+};
+
+export type EscalationDriver = { code: string; level: number; detail: string };
+
+export type IncidentEvent = {
+  at: string;
+  from: string;
+  to: string;
+  reason: string;
+  kind: "opened" | "escalated" | "de-escalated" | "acknowledged" | "status" | "resolved" | string;
+};
+
+export type Incident = {
+  id: string;
+  kind: "TRACK_FAILURE" | "SEVERE_WEATHER" | string;
+  track_id: string;
+  corridor: string;
+  level: number;
+  code: string;
+  tier_label: string;
+  owner: string;
+  posture: string;
+  peak_code: string;
+  resolution: Resolution;
+  resolution_reason: string;
+  acknowledged_by: string | null;
+  age_seconds: number;
+  tier_age_seconds: number;
+  sla_seconds: number | null;
+  closed: boolean;
+  affected_trains: string[];
+  passengers_at_risk: number;
+  dispositions: Record<string, Disposition>;
+  progress: {
+    trains_recovered: number;
+    trains_total: number;
+    actions_done: number;
+    actions_total: number;
+  };
+  drivers: EscalationDriver[];
+  work_items: WorkItem[];
+  events: IncidentEvent[];
+};
+
+export type Escalation = {
+  level: number;
+  code: string;
+  label: string;
+  owner: string;
+  posture: string;
+  resolution: Resolution;
+  totals: { open: number; complete: number; partial: number; blocked: number; unresolved: number };
+  incidents: Incident[];
+  severed_pairs: number;
+  generated_at: string;
+  twin_source?: string;
+};
+
+export type HandoffBrief = {
+  incident_id: string;
+  resolution: Resolution;
+  level: string;
+  escalating_to: string;
+  text: string;
+  source: "llm" | "rules" | string;
+};
+
+export type Explanation = { text: string; source: "llm" | "rules" | string };
 
 export type RunResponse = {
   injected_failure?: string;
@@ -55,6 +138,7 @@ export type RunResponse = {
   trains?: Train[];
   executed_plan?: string;
   applied_actions?: string[];
+  escalation?: Escalation;
 };
 
 export type LiveTrack = {
@@ -399,6 +483,285 @@ export async function resetTwin(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ── Escalation ──────────────────────────────────────────────────────────────
+
+const TIER_OWNERS: Record<number, { code: string; label: string; owner: string; posture: string }> =
+  {
+    0: {
+      code: "L0",
+      label: "Steady State",
+      owner: "Section Controller",
+      posture: "Routine monitoring — no active response.",
+    },
+    1: {
+      code: "L1",
+      label: "Advisory",
+      owner: "Section Controller",
+      posture: "Assets degraded. Watch and restrict; no train is impacted yet.",
+    },
+    2: {
+      code: "L2",
+      label: "Elevated",
+      owner: "Divisional Controller",
+      posture: "Trains are impacted. Recovery is owned and in progress.",
+    },
+    3: {
+      code: "L3",
+      label: "Critical",
+      owner: "Divisional Emergency Cell",
+      posture: "Passengers are stranded or failures are compounding.",
+    },
+    4: {
+      code: "L4",
+      label: "Emergency",
+      owner: "Zonal Emergency Control Room",
+      posture: "The network cannot recover unaided.",
+    },
+  };
+
+export const STEADY_STATE: Escalation = {
+  level: 0,
+  ...TIER_OWNERS[0],
+  resolution: "COMPLETE",
+  totals: { open: 0, complete: 0, partial: 0, blocked: 0, unresolved: 0 },
+  incidents: [],
+  severed_pairs: 0,
+  generated_at: "",
+};
+
+/**
+ * Offline escalation, derived from a mock run. The backend ledger grades the
+ * real twin; with no backend the console still has to answer "how urgent is
+ * this, and is the work done?" — so the same shape is synthesised from what
+ * the mock pipeline already knows. `executed` flips the committed work to
+ * verified, mirroring what the ledger would observe after an apply.
+ */
+export function buildMockEscalation(r: RunResponse, executed = false): Escalation {
+  const failed = r.failed_tracks?.[0];
+  if (!failed) return { ...STEADY_STATE, generated_at: nowHMS() };
+
+  const track = trackById(failed);
+  const held = r.held_trains ?? [];
+  const rerouted = r.rerouted_trains ?? [];
+  const affected = [...new Set([...held, ...rerouted.map((x) => x.id)])].sort();
+  const passengers = TRAINS.filter((t) => affected.includes(t.id)).reduce(
+    (a, b) => a + b.passengers,
+    0,
+  );
+
+  const dispositions: Record<string, Disposition> = {};
+  for (const id of affected) {
+    dispositions[id] = executed ? "RECOVERED" : held.includes(id) ? "HELD" : "EXPOSED";
+  }
+
+  const work: WorkItem[] = [
+    {
+      id: "WI-001",
+      kind: "close_track",
+      label: `Close ${failed}`,
+      target: failed,
+      incident_id: "INC-001",
+      state: executed ? "DONE" : "PENDING",
+      detail: executed
+        ? `Track ${failed} confirmed out of service on the twin.`
+        : "Not yet executed.",
+    },
+    ...rerouted.map((x, i) => ({
+      id: `WI-${String(i + 2).padStart(3, "0")}`,
+      kind: "reroute" as const,
+      label: `Reroute ${x.id}`,
+      target: x.id,
+      incident_id: "INC-001",
+      state: (executed ? "DONE" : "PENDING") as WorkState,
+      detail: executed
+        ? `${x.id} is running the alternate corridor.`
+        : `${x.id} has not taken the alternate corridor yet.`,
+    })),
+  ];
+
+  const recovered = Object.values(dispositions).filter((d) => d === "RECOVERED").length;
+  const done = work.filter((w) => w.state === "DONE").length;
+  const resolution: Resolution = executed
+    ? "COMPLETE"
+    : done > 0 || recovered > 0
+      ? "PARTIAL"
+      : "UNRESOLVED";
+  const level = executed ? 0 : held.length > 0 ? 3 : 2;
+  const tier = TIER_OWNERS[level];
+
+  const incident: Incident = {
+    id: "INC-001",
+    kind: "TRACK_FAILURE",
+    track_id: failed,
+    corridor: `${failed} · ${stationName(track?.from ?? "")} ↔ ${stationName(track?.to ?? "")}`,
+    level,
+    ...tier,
+    tier_label: tier.label,
+    peak_code: TIER_OWNERS[Math.max(level, 2)].code,
+    resolution,
+    resolution_reason: executed
+      ? `All ${affected.length} affected train(s) recovered and every committed action verified on the twin.`
+      : `No committed action has landed on the twin yet; ${affected.length} train(s) impacted.`,
+    acknowledged_by: null,
+    age_seconds: 0,
+    tier_age_seconds: 0,
+    sla_seconds: level === 3 ? 120 : 180,
+    closed: false,
+    affected_trains: affected,
+    passengers_at_risk: passengers,
+    dispositions,
+    progress: {
+      trains_recovered: recovered,
+      trains_total: affected.length,
+      actions_done: done,
+      actions_total: work.length,
+    },
+    drivers: [
+      { code: "ASSET", level: 1, detail: `${failed} is out of service.` },
+      ...(held.length
+        ? [
+            {
+              code: "STOPPED",
+              level: 3,
+              detail: `${held.length} train(s) brought to a stand: ${held.join(", ")}.`,
+            },
+          ]
+        : []),
+    ],
+    work_items: work,
+    events: [
+      {
+        at: nowHMS(-4),
+        from: "L0",
+        to: "L1",
+        reason: `Track failure detected on ${failed}.`,
+        kind: "opened",
+      },
+      {
+        at: nowHMS(-2),
+        from: "L1",
+        to: tier.code,
+        reason: held.length
+          ? `${held.length} train(s) brought to a stand.`
+          : `${affected.length} train(s) routed into the failure.`,
+        kind: "escalated",
+      },
+    ],
+  };
+
+  return {
+    level,
+    ...tier,
+    resolution,
+    totals: {
+      open: 1,
+      complete: resolution === "COMPLETE" ? 1 : 0,
+      partial: resolution === "PARTIAL" ? 1 : 0,
+      blocked: 0,
+      unresolved: resolution === "UNRESOLVED" ? 1 : 0,
+    },
+    incidents: [incident],
+    severed_pairs: 0,
+    generated_at: nowHMS(),
+  };
+}
+
+function isEscalation(x: unknown): x is Escalation {
+  if (!x || typeof x !== "object") return false;
+  const e = x as Record<string, unknown>;
+  return (
+    typeof e.code === "string" &&
+    typeof e.resolution === "string" &&
+    Array.isArray(e.incidents) &&
+    !!e.totals
+  );
+}
+
+/** Current handling level and completion signal. Null when the backend is offline. */
+export async function fetchEscalation(): Promise<Escalation | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(`${API_BASE_URL}/escalation`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json: unknown = await res.json();
+    return isEscalation(json) ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Take ownership at the current tier. Returns the re-graded state, or null offline. */
+export async function acknowledgeIncident(
+  incidentId: string,
+  owner = "Console Operator",
+): Promise<Escalation | null> {
+  try {
+    const res = await fetch(
+      `${API_BASE_URL}/incidents/${encodeURIComponent(incidentId)}/acknowledge?owner=${encodeURIComponent(owner)}`,
+      { method: "POST" },
+    );
+    if (!res.ok) return null;
+    const json: unknown = await res.json();
+    return isEscalation(json) ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function draftBrief(incidentId: string): Promise<HandoffBrief | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(`${API_BASE_URL}/incidents/${encodeURIComponent(incidentId)}/brief`, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json = (await res.json()) as HandoffBrief;
+    return typeof json?.text === "string" ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Deterministic offline brief — same four sections the backend template writes. */
+export function buildMockBrief(incident: Incident): HandoffBrief {
+  const p = incident.progress;
+  const stuck = Object.entries(incident.dispositions)
+    .filter(([, d]) => d !== "RECOVERED")
+    .map(([id, d]) => `${id} ${d.toLowerCase()}`);
+  const done = incident.work_items.filter((w) => w.state === "DONE").map((w) => w.label);
+  const pending = incident.work_items.filter((w) => w.state !== "DONE").map((w) => w.label);
+
+  const ask =
+    incident.resolution === "BLOCKED"
+      ? `ASK: ${incident.owner} to authorise physical restoration — ${incident.resolution_reason}`
+      : incident.resolution === "COMPLETE"
+        ? `ASK: ${incident.owner} to confirm stand-down; all committed work is verified on the twin.`
+        : incident.resolution === "PARTIAL"
+          ? `ASK: ${incident.owner} to keep ownership until ${pending.join(", ") || "the outstanding actions"} complete.`
+          : `ASK: ${incident.owner} to approve and execute a recovery plan now — no committed action has landed.`;
+
+  return {
+    incident_id: incident.id,
+    resolution: incident.resolution,
+    level: incident.code,
+    escalating_to: incident.owner,
+    source: "rules",
+    text: [
+      `SITUATION: ${incident.corridor} is out of service at ${incident.code} ${incident.tier_label}.`,
+      `IMPACT: ${p.trains_recovered}/${p.trains_total} affected train(s) recovered, ${incident.passengers_at_risk} passengers at risk${stuck.length ? `; ${stuck.join(", ")}` : ""}.`,
+      done.length
+        ? `DONE: ${p.actions_done}/${p.actions_total} committed action(s) verified — ${done.join(", ")}.`
+        : "DONE: nothing verified complete yet.",
+      ask,
+    ].join("\n"),
+  };
 }
 
 export type StreamParams = {

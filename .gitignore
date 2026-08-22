@@ -18,9 +18,5 @@ db.sqlite3
 railmind/data/osm_cache.json
 
 # Editor / tooling
-.opencode/
 .vscode/
 .idea/
-.claude/
-.opencode
-.impeccable/
